@@ -1,7 +1,8 @@
-/* $Id: wl24n.h,v 1.1 2002/10/28 21:09:29 jal2 Exp $ */
+/* $Id: wl24n.h,v 1.2 2002/11/04 21:23:56 jal2 Exp $ */
 
 /* ===========================================================    
     Copyright (C) 2002 Joerg Albert - joerg.albert@gmx.de
+    Copyright (C) 2002 Alfred Arnold alfred@ccac.rwth-aachen.de
 
     Portions of the source code are based on code by
     David A. Hinds under Copyright (C) 1999 David A. Hinds
@@ -144,11 +145,11 @@ typedef enum {
 
 /* initializes the driver */
 void *wl24n_card_init(uint32 dbg_mask, uint32 msg_to_dbg_mask,
-		      uint32 msg_from_dbg_mask,
-		      int BaseAddr, int irq, LLCType_t llctype, 
-		      BSSType_t bsstype, uint8 *ESSID,
-		      uint8 Channel, int *open_counter, char **dev_name, 
-		      uint32 trace_mask);
+          uint32 msg_from_dbg_mask,
+          int BaseAddr, int irq, LLCType_t llctype, 
+          BSSType_t bsstype, uint8 *ESSID, int ESSID_len,
+          uint8 Channel, int *open_counter, char **dev_name, 
+          uint32 trace_mask);
 
 /* stops the driver */
 void wl24n_card_stop(void *priv);

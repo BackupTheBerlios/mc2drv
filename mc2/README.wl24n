@@ -1,7 +1,8 @@
-$Id: README.wl24n,v 1.1 2002/10/28 21:09:03 jal2 Exp $
+$Id: README.wl24n,v 1.2 2002/11/04 21:23:56 jal2 Exp $
 
 /* ===========================================================    
     Copyright (C) 2002 Joerg Albert - joerg.albert@gmx.de
+    Copyright (C) 2002 Alfred Arnold alfred@ccac.rwth-aachen.de
 
     Portions of the source code are based on code by
     David A. Hinds under Copyright (C) 1999 David A. Hinds
@@ -18,12 +19,14 @@ Hi,
 this driver for the ELSA Airlancer MC-2 WLAN card was derived from the
 original ELSA source for kernel 2.0.x, 2.2.x by Alfred Arnold.
 
+It is now hosted at http://mc2drv.berlios.de .
+
 
 1. Requirements
 ---------------
 
 a) David Hinds PCMCIA package
-b) a kernel 2.2.x or 2.4.x with correctly configured kernel sources.
+b) a kernel 2.2.x or 2.4.x with correctly configured kernel sources
 
 2. Actions
 ----------
@@ -61,9 +64,16 @@ The wl24_cs.o module recognizes the following parameters:
     A irq mask to select from  (see PCMCIA doc)
     default: 0xdeb8
 
+- nwn_is_hex: values 0 or 1. If set to 1, the value of networkname
+    (see below) is interpreted as a sequence of hexdigits (allowing
+    networknames with \0 ...), if set to 0 the networkname is just
+    taken as a string.
+       
 - networkname: the symbolic name of your ESS, equivalent to the WLAN
     domain set in the LANCOM Wireless access point or the AirLancer Windows
     driver.  This is an ASCII string of max. 32 characters.
+    If the parameter nwn_is_hex is set to 1, the string is interpreted
+    as a sequence of hexdigits.
 
     PLEASE NOTE: A networkname of ANY doesn't catch any networkid of a BSS
                  as it was with previous versions. Use an empty string instead.
@@ -120,8 +130,12 @@ and the new parameters are used.
 - networktype infrastructure : "iwconfig ethX mode Managed"
 - networktype ad-hoc :         "iwconfig ethX mode Ad-hoc"
 - Channel N :                  "iwconfig ethX channel N" 
+- WEP encryption parameters :  "iwconfig ethX encryption ..."
 - LLCType Wavelan :            "iwpriv ethX set_llc 1"
 - LLCType IEEE802.11 :         "iwpriv ethX set_llc 2"
+
+NOTE: To support WEP encryption/decryption, the card's firmware
+      must be 2.0.6 or later!
 
 
 4. Information
@@ -168,6 +182,8 @@ b) SuSE 7.3, 2.4.18 (external PCMCIA), pcmcia-cs 3.1.34, network = 1, LLCType = 
 c) debian, kernel 2.4.18, pcmcia-cs 3.1.33, network = 0, LLCType = ?
    access point:  Orinoco AP 1000
 
+d) SuSE 7.3, 2.4.19 (external PCMCIA), pcmcia-cs 3.1.34, network = 1, LLCType = 1
+   access point:  Belkin F5D6130, firmware 1.4g.8
 
 
 6. Known Bugs
@@ -179,13 +195,22 @@ c) debian, kernel 2.4.18, pcmcia-cs 3.1.33, network = 0, LLCType = ?
 
 7. History
 ----------
-- version 1.43 (10-26-2002)
-	- added the SSID in all ScanRequests but the first one
-	  to deal with APs in "closed network" mode (e.g. Agere's APs)
-	  NOTE: This is not tested yet and requires firmware >= 2.10 !!
-	- added copyright info in all files
-	- added TODO, Acknowledgements in this file
+- version 1.51 (11-04-2002)
+  - merged version 1.50 and 1.43
+  - added support for SSID with non-printable content incl. new module
+    parameter nwn_is_hex
+  - added support for Belkin's closed network mode (SSID filled with \0 ...)
 
+- version 1.50 (10-26-2002)
+ 	- added WEP encryption/decryption (A. Arnold)
+
+- version 1.43 (10-26-2002)
+ 	- added the SSID in all ScanRequests but the first one
+ 	  to deal with APs in "closed network" mode (e.g. Agere's APs)
+ 	  NOTE: This is not tested yet and requires firmware >= 2.10 !!
+  - added copyright info in all files
+  - added TODO, Acknowledgements in this file
+ 
 - version 1.42 (08-03-2002)
 	- fixed bug in SNAP header in transmit data. Now it works
 	  with the MC-11 in ad-hoc mode (use LLCType Wavelan).
@@ -218,10 +243,12 @@ c) debian, kernel 2.4.18, pcmcia-cs 3.1.33, network = 0, LLCType = ?
 - version 1.40:
 	first heavily re-written version
 
+
 8. Firmware Versions
 --------------------
+
 - 2.6
-  This version has problems to join Agere cards in AP mode, which are
+  This version has problems to join Agere's access points, which are
   configured for "closed network", because it always sends probe requests
   with an empty SSID (even if another SSID was specified).
 - 2.10
@@ -229,20 +256,21 @@ c) debian, kernel 2.4.18, pcmcia-cs 3.1.33, network = 0, LLCType = ?
   need to be tested. This firmware requires a driver version equal or 
   above 1.43 for interworking with APs in "closed network" mode.
 
+
 9.  TODO
 --------
 - roaming between ESS based on RSSI values, more intelligent algorithms 
   to choose BSS
-- describe how to update the firmware of the card
-- add WEP support in the driver
 - add support for BSS list of iwconfig
+
 
 10. Acknowledgements
 --------------------
 They go to Alfred Arnolds who anserwed a lot of stupid questions and 
-worked on the firmware, Heiko Kirschke who did the adaptation to the 2.4
-kernel, Stefan Goerg and all the people who spend their time with testing,
-source reading and bug reports.
+worked on the firmware, Heiko Kirschke who did the first adaptation
+to the 2.4 kernel, Stefan Goerg and all the people who spent their
+time with testing, source reading and bug reports.
+
 
 11. Filelist
 -----------
@@ -256,14 +284,19 @@ source reading and bug reports.
 
 ./etc/AirLancer.conf                 sample configuration
 
+./clients/wl24frm.[ch]                WEP implementation
 ./clients/{wl24n.[ch],wl24n_cs.[ch]} C source code
 ./clients/wl24_cs.o                  kernel module
 
 
-12. Contact
-----------
+12. Links & Contact
+-------------------
 
-joerg.albert@gmx.de
+http://mc2drv.berlios.de - Releases, Mailing Lists, CVS tree
+
+mailto:joerg.albert@gmx.de
+
+mailto:alfred@ccac.rwth-aachen.de
 
 
 

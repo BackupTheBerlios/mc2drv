@@ -1,7 +1,8 @@
-# $Id $
+# $Id: wl24n_cs.mk,v 1.2 2002/11/04 21:23:56 jal2 Exp $
 
 # ===========================================================    
 #    Copyright (C) 2002 Joerg Albert - joerg.albert@gmx.de
+#    Copyright (C) 2002 Alfred Arnold alfred@ccac.rwth-aachen.de
 #
 #    Portions of the source code are based on code by
 #    David A. Hinds under Copyright (C) 1999 David A. Hinds
@@ -37,19 +38,14 @@ CPPFLAGS = $(PCDEBUG) -D__KERNEL__ -DMODULE -I../include \
 
 all: wl24_cs.o
 
-wl24n.o: wl24n.h wl24n_cs.h
+wl24n.o: wl24n.h wl24n_cs.h wl24nfrm.h
 wl24n_cs.o: wl24n_cs.h wl24n.h
 
-wl24_cs.o: wl24n_cs.o wl24n.o
+wl24_cs.o: wl24n_cs.o wl24n.o wl24nfrm.o
 	$(LD) -r -o $@ $^
 
-TAGS: wl24n_cs.c wl24n.c wl24n.h wl24n_cs.h
+TAGS: wl24n_cs.c wl24n.c wl24nfrm.c wl24n.h wl24n_cs.h wl24nfrm.h
 	etags $^
 
 clean:
-	-rm wl24n_cs.o wl24_cs.o wl24n.o
-
-
-
-
-
+	-rm wl24n_cs.o wl24_cs.o wl24n.o wl24nfrm.o

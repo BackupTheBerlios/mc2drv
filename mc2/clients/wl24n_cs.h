@@ -1,7 +1,8 @@
-/* $Id: wl24n_cs.h,v 1.1 2002/10/28 21:09:33 jal2 Exp $ */
+/* $Id: wl24n_cs.h,v 1.2 2002/11/04 21:23:56 jal2 Exp $ */
 
 /* ===========================================================    
     Copyright (C) 2002 Joerg Albert - joerg.albert@gmx.de
+    Copyright (C) 2002 Alfred Arnold alfred@ccac.rwth-aachen.de
 
     Portions of the source code are based on code by
     David A. Hinds under Copyright (C) 1999 David A. Hinds

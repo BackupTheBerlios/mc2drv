@@ -1,21 +1,21 @@
-/* $Id: wl24n.c,v 1.1 2002/10/28 21:09:29 jal2 Exp $ */
+/* $Id: wl24n.c,v 1.2 2002/11/04 21:23:56 jal2 Exp $ */
 /* ===========================================================    
-    Copyright (C) 2002 Joerg Albert - joerg.albert@gmx.de
+   Copyright (C) 2002 Joerg Albert - joerg.albert@gmx.de
+   Copyright (C) 2002 Alfred Arnold alfred@ccac.rwth-aachen.de
 
-    Portions of the source code are based on code by
-    David A. Hinds under Copyright (C) 1999 David A. Hinds
-    and on code by Jean Tourrilhes under
-    Copyright (C) 2001 Jean Tourrilhes, HP Labs <jt@hpl.hp.com> 
+   Portions of the source code are based on code by
+   David A. Hinds under Copyright (C) 1999 David A. Hinds
+   and on code by Jean Tourrilhes under
+   Copyright (C) 2001 Jean Tourrilhes, HP Labs <jt@hpl.hp.com> 
 
-    This software may be used and distributed according to the
-    terms of the GNU Public License 2, incorporated herein by
-    reference.
+   This software may be used and distributed according to the
+   terms of the GNU Public License 2, incorporated herein by
+   reference.
    =========================================================== */
 
 /* Trying to implement a driver for ELSA MC2 (Am79C930 + PRISM chipset) newly from
    scratch for 2.4 kernels. Based on ELSA's example.
    Skipped: PnP, flash loading
-   MPL / GPL
 
    all procedures called wl24* are called from extern */
 
@@ -61,6 +61,7 @@
 #include <asm/delay.h>
 
 #include "wl24n_cs.h" /* the i/f we use from the pcmcia part */
+#include "wl24nfrm.h" /* 802.11 frame handling */
 #include "wl24n.h" /* our own i/f */
 
 #if (LINUX_VERSION_CODE < KERNEL_VERSION(2,2,0))
@@ -113,7 +114,12 @@ static inline void init_waitqueue_head(wait_queue_head_t *hd)
 //#define LOG_MDIND_NO_PAYLOAD
 #define LOG_CARD_REMOVED
 //#define LOG_FREQDOMAIN
+//#define LOG_IWENCODE  /* log info on SIOC[GS]IWENCODE ioctl's */
 #endif //#ifdef INTERNAL_LOG
+
+/* we need <= 32 zeros to pass a dummy bssid and compare the SSID to it */
+static const uint8 zeros[IW_ESSID_MAX_SIZE] = {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+																							 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0};
 
 /* IEEE802.11 defines */
 #define SIZE_OF_SSID (1+1+32)
@@ -295,7 +301,7 @@ static const uint8 zerob = 0;
 /* some interesting addresses in the card SRAM PAGE 0 (BSS_SPAGE0 == 0) */
 
 /* read the selftest result from here (after writing a zero to it):
-   a 'W' means OK and must be ack'ed with a 'A' at the same location */
+   a 'W' means OK and must be ack'ed with a 'A'/'H' at the same location */
 #define WL_SELFTEST_ADDR 0x480
 
 /* this struct describes the values from WL_SELFTEST_ADDR on: */
@@ -533,7 +539,7 @@ typedef struct _wl24cb_t {
   uint32 dbg_mask; /* bit mask to switch debugs on */
   uint32 msg_from_dbg_mask;
   uint32 msg_to_dbg_mask; /* bit mask for msgs to/from firmware,
-                          used if DBG_MSG_WITH_CARD is set in dbg_mask */
+                             used if DBG_MSG_WITH_CARD is set in dbg_mask */
 
   int BaseAddr; /* base address of IO register of card */
   uint8 MacAddress[SZ_MAC_ADDR]; /* MAC address read 
@@ -556,7 +562,7 @@ typedef struct _wl24cb_t {
 
   int last_mibcfm_valid; /* signal by the ISR that a MIBCfm (get or set) has arrived */
   GetCfm_t last_mibcfm; /* the content of the last GetCfm or SetCfm from card 
-                            (SetCfm_t matches the begin of GetCfm_t !) */
+                           (SetCfm_t matches the begin of GetCfm_t !) */
 
   State_fct_t state; /* current state of driver's state machine */
 
@@ -588,7 +594,7 @@ typedef struct _wl24cb_t {
   TraceEntry_t trace[TRACE_NR_RECS];
 #endif
   uint32 trace_mask;  /* what shall we trace: trace event n, 
-			 if n-th bit in mask is set */
+                         if n-th bit in mask is set */
 
   uint32 proc_read_bss_idx;  /* two counter used in proc_read_bss/_trace */
   uint32 proc_read_trace_idx;
@@ -602,21 +608,25 @@ typedef struct _wl24cb_t {
      the chain in the tx buffer area */
   int txbuf_len_list_len; /* length of list below */
   uint16 *txbuf_len_list; /* array with element for each txbuf, stores the last
-			   tx len when this buffer was the first one in the
-			   chain */
+                             tx len when this buffer was the first one in the
+                             chain */
 
   int was_restarted; /* set to 1 by restart_card,
-			used in wl24n_rxint to recognizes if any 
-			state procedure has resetted the
-			card and we don't need to call cfm_done */
+                        used in wl24n_rxint to recognizes if any 
+                        state procedure has resetted the
+                        card and we don't need to call cfm_done */
 
   char nickname[IW_ESSID_MAX_SIZE+1]; /* nickname set & get only by 
-					 wireless tools */
+                                         wireless tools */
 
 #if IW_MAX_SPY > 0
   int iwspy_number; /* number of valid entries in iwspy[] below */
   Wlspy_t  iwspy[IW_MAX_SPY];
 #endif
+
+  Wlwepstate_t wepstate;
+  databuffer_t databuffer;
+  uint8 cardmode;
 } WL24Cb_t;
 
 
@@ -639,8 +649,8 @@ static void copy_from_card(void *dest, CardAddr_t src,
 
 
 bool ScanReq(WL24Cb_t *cb, uint16 min_channel_time,
-              uint16 max_channel_time, BSSType_t bsstype,
-              ScanType_t scantype);
+             uint16 max_channel_time, BSSType_t bsstype,
+             ScanType_t scantype);
 
 bool SetMIBReq(WL24Cb_t *cb, uint16 attr, void *src, size_t sz);
 bool GetMIBReq(WL24Cb_t *cb, uint16 attrib);
@@ -688,14 +698,14 @@ FreqDomainDescr_t const *getFreqDomainDescr(uint16 code)
 #ifdef CHECK_ALLOC_TXBUF
 /* == PROC check_buf_addr == */
 int check_buf_addr(WL24Cb_t *cb, char const *str1, 
-		   char const *str2, Card_Word_t buf)
+                   char const *str2, Card_Word_t buf)
 {
   int idx;
   if (buf < cb->FreeTxBufStart || buf >= cb->FreeTxBufEnd) {
     if (cb->dbg_chk_txbuf_print) {
       printk(KERN_WARNING "%s %s: %s addr x%x out of txbuf area (x%x-x%x)\n",
-	     cb->name, str1, str2, buf, cb->FreeTxBufStart,
-	     cb->FreeTxBufEnd-1);
+             cb->name, str1, str2, buf, cb->FreeTxBufStart,
+             cb->FreeTxBufEnd-1);
       cb->dbg_chk_txbuf_print--;
       return 0;
     }
@@ -705,8 +715,8 @@ int check_buf_addr(WL24Cb_t *cb, char const *str1,
   if ((cb->FreeTxBufStart + idx * sizeof(Card_TxBuf_t)) != buf) {
     if (cb->dbg_chk_txbuf_print) {
       printk(KERN_WARNING "%s %s: %s addr x%x not on boundary (x%x-x%x,x%x)\n",
-	     cb->name, str1, str2, buf, cb->FreeTxBufStart,
-	     cb->FreeTxBufEnd-1, sizeof(Card_TxBuf_t));
+             cb->name, str1, str2, buf, cb->FreeTxBufStart,
+             cb->FreeTxBufEnd-1, sizeof(Card_TxBuf_t));
       cb->dbg_chk_txbuf_print--;
       return 0;
     }
@@ -737,9 +747,9 @@ int dbg_txbuf_mark(WL24Cb_t *cb, Card_Word_t buf, int used, Card_Word_t parent)
     return 0;
 
   /* ignore parent if used == 0, i.e. if the buffer is free'd */
-   if (used)
-     if (!check_buf_addr(cb, __FUNCTION__, "parent", parent))
-       return 0;
+  if (used)
+    if (!check_buf_addr(cb, __FUNCTION__, "parent", parent))
+      return 0;
 
   idx = (buf - cb->FreeTxBufStart) / sizeof(Card_TxBuf_t);
 
@@ -747,23 +757,23 @@ int dbg_txbuf_mark(WL24Cb_t *cb, Card_Word_t buf, int used, Card_Word_t parent)
     if (cb->dbg_txbuf[idx].used) {
 
       if (cb->dbg_chk_txbuf_print) {
-	printk(KERN_WARNING "%s: %s buf x%x in use: alloced %lu ticks before , parent x%x sigid x%x\n", 
-	       cb->name, __FUNCTION__, buf, jiffies - cb->dbg_txbuf[idx].jiffies,
-	       cb->dbg_txbuf[idx].parent, cb->dbg_txbuf[idx].sigid);
-	if (check_buf_addr(cb, __FUNCTION__, "parent", cb->dbg_txbuf[idx].parent)) {
-	  Card_Word_t parent = cb->dbg_txbuf[idx].parent;
-	  int i = (parent - cb->FreeTxBufStart) / sizeof(Card_TxBuf_t);
-	  if (cb->dbg_txbuf[i].used) {
-	    printk(KERN_WARNING "%s: %s parent x%x: used, alloced %lu ticks before, parent x%x, sigid x%x\n",
-		   cb->name, __FUNCTION__, parent, 
-		   jiffies - cb->dbg_txbuf[i].jiffies, cb->dbg_txbuf[i].parent,
-		   cb->dbg_txbuf[i].sigid);
-	  } else {
-	    printk(KERN_WARNING "%s: %s parent x%x: free\n",
-		   cb->name, __FUNCTION__, parent);
-	  }
-	}
-	cb->dbg_chk_txbuf_print--;
+        printk(KERN_WARNING "%s: %s buf x%x in use: alloced %lu ticks before , parent x%x sigid x%x\n", 
+               cb->name, __FUNCTION__, buf, jiffies - cb->dbg_txbuf[idx].jiffies,
+               cb->dbg_txbuf[idx].parent, cb->dbg_txbuf[idx].sigid);
+        if (check_buf_addr(cb, __FUNCTION__, "parent", cb->dbg_txbuf[idx].parent)) {
+          Card_Word_t parent = cb->dbg_txbuf[idx].parent;
+          int i = (parent - cb->FreeTxBufStart) / sizeof(Card_TxBuf_t);
+          if (cb->dbg_txbuf[i].used) {
+            printk(KERN_WARNING "%s: %s parent x%x: used, alloced %lu ticks before, parent x%x, sigid x%x\n",
+                   cb->name, __FUNCTION__, parent, 
+                   jiffies - cb->dbg_txbuf[i].jiffies, cb->dbg_txbuf[i].parent,
+                   cb->dbg_txbuf[i].sigid);
+          } else {
+            printk(KERN_WARNING "%s: %s parent x%x: free\n",
+                   cb->name, __FUNCTION__, parent);
+          }
+        }
+        cb->dbg_chk_txbuf_print--;
       } /* if (cb->dbg_chk_txbuf_print) */
 
       return 0;
@@ -780,9 +790,9 @@ int dbg_txbuf_mark(WL24Cb_t *cb, Card_Word_t buf, int used, Card_Word_t parent)
     /* !used */
     if (!cb->dbg_txbuf[idx].used) {
       if (cb->dbg_chk_txbuf_print) {
-	printk(KERN_WARNING "%s: %s buf x%x already free\n", 
-	       cb->name, __FUNCTION__, buf);
-	cb->dbg_chk_txbuf_print--;
+        printk(KERN_WARNING "%s: %s buf x%x already free\n", 
+               cb->name, __FUNCTION__, buf);
+        cb->dbg_chk_txbuf_print--;
       }
       return 0;
     } else {
@@ -826,7 +836,7 @@ static void trace_add(WL24Cb_t *cb, uint8 id, uint8 *data, int len)
 
 #if 0
   printk(KERN_DEBUG "%s %s: id %d len %d data: %02x %02x\n",
-	 cb->name, __FUNCTION__, id, len, data[0], data[1]);
+         cb->name, __FUNCTION__, id, len, data[0], data[1]);
 #endif
 
   /* only trace if mask bit is set */
@@ -859,6 +869,20 @@ void dumpk(uint8 *addr, int sz)
     printk("%02x ",*addr++);
 }
 
+void dumpk2(uint8 *addr, int sz)
+{
+  int z;
+
+  for (z = 0; z < sz; z++)
+    {
+      if ((z & 15) == 0)
+        printk("%04x: ", z);
+      printk("%02x ",*addr++);
+      if ((z & 15) == 15)
+        printk("\n");
+    }
+}
+
 /* == PROC printc ==
    print to console   */
 void printc(char const *fmt, ...)
@@ -888,7 +912,7 @@ char *rateset2str(uint8 *set, char *buf, int sz)
     if (*r > 0x80) {
       speed = *r - 0x80;
       p += sprintf(p, "%d%sMbit ", speed/2,
-		   speed % 2 ? ".5" : "");
+                   speed % 2 ? ".5" : "");
     }
     r++;
   } /* while (nr-- ...) */
@@ -904,53 +928,53 @@ char *rateset2str(uint8 *set, char *buf, int sz)
 char *sigid2str(uint8 sigid)
 {
   switch (sigid) {
-      case Alarm_ID: return "Alarm";
-      case MdConfirm_ID: return "MdConfirm";
-      case MdIndicate_ID: return "MdIndicate";
-      case AssocConfirm_ID: return "AssocConfirm";
-      case AssocIndicate_ID: return "AssocIndicate";
-      case AuthConfirm_ID: return "AuthConfirm";
-      case AuthIndicate_ID: return "AuthIndicate";
-      case DeauthConfirm_ID: return "DeauthConfirm";
-      case DeauthIndicate_ID: return "DeauthIndicate";
-      case DisassocConfirm_ID: return "DisassocConfirm";
-      case DisassocIndicate_ID: return "DisassocIndicate";
-      case GetConfirm_ID: return "GetConfirm";
-      case JoinConfirm_ID: return "JoinConfirm";
-      case PowermgtConfirm_ID: return "PowermgtConfirm";
-      case ReassocConfirm_ID: return "ReassocConfirm";
-      case ReassocIndicate_ID: return "ReassocIndicate";
-      case ScanConfirm_ID: return "ScanConfirm";
-      case SetConfirm_ID: return "SetConfirm";
-      case StartConfirm_ID: return "StartConfirm";
-      case ResyncConfirm_ID: return "ResyncConfirm";
-      case SiteConfirm_ID: return "SiteConfirm";
-      case SaveConfirm_ID: return "SaveConfirm";
-      case RFtestConfirm_ID: return "RFtestConfirm";
-      case AssocRequest_ID: return "AssocRequest";
-      case AuthRequest_ID: return "AuthRequest";
-      case DeauthRequest_ID: return "DeauthRequest";
-      case DisassocRequest_ID: return "DisassocRequest";
-      case GetRequest_ID: return "GetRequest";
-      case JoinRequest_ID: return "JoinRequest";
-      case PowermgtRequest_ID: return "PowermgtRequest";
-      case ReassocRequest_ID: return "ReassocRequest";
-      case ScanRequest_ID: return "ScanRequest";
-      case SetRequest_ID: return "SetRequest";
-      case StartRequest_ID: return "StartRequest";
-      case MdRequest_ID: return "MdRequest";
-      case ResyncRequest_ID: return "ResyncRequest";
-      case SiteRequest_ID: return "SiteRequest";
-      case SaveRequest_ID: return "SaveRequest";
-      case RFtestRequest_ID: return "RFtestRequest";
-      case MmConfirm_ID: return "MmConfirm";
-      case MmIndicate_ID: return "MmIndicate";
-      default:
-      {
-        static char buf[5];
-        sprintf(buf,"<%02x>",sigid);
-        return buf;
-      }
+  case Alarm_ID: return "Alarm";
+  case MdConfirm_ID: return "MdConfirm";
+  case MdIndicate_ID: return "MdIndicate";
+  case AssocConfirm_ID: return "AssocConfirm";
+  case AssocIndicate_ID: return "AssocIndicate";
+  case AuthConfirm_ID: return "AuthConfirm";
+  case AuthIndicate_ID: return "AuthIndicate";
+  case DeauthConfirm_ID: return "DeauthConfirm";
+  case DeauthIndicate_ID: return "DeauthIndicate";
+  case DisassocConfirm_ID: return "DisassocConfirm";
+  case DisassocIndicate_ID: return "DisassocIndicate";
+  case GetConfirm_ID: return "GetConfirm";
+  case JoinConfirm_ID: return "JoinConfirm";
+  case PowermgtConfirm_ID: return "PowermgtConfirm";
+  case ReassocConfirm_ID: return "ReassocConfirm";
+  case ReassocIndicate_ID: return "ReassocIndicate";
+  case ScanConfirm_ID: return "ScanConfirm";
+  case SetConfirm_ID: return "SetConfirm";
+  case StartConfirm_ID: return "StartConfirm";
+  case ResyncConfirm_ID: return "ResyncConfirm";
+  case SiteConfirm_ID: return "SiteConfirm";
+  case SaveConfirm_ID: return "SaveConfirm";
+  case RFtestConfirm_ID: return "RFtestConfirm";
+  case AssocRequest_ID: return "AssocRequest";
+  case AuthRequest_ID: return "AuthRequest";
+  case DeauthRequest_ID: return "DeauthRequest";
+  case DisassocRequest_ID: return "DisassocRequest";
+  case GetRequest_ID: return "GetRequest";
+  case JoinRequest_ID: return "JoinRequest";
+  case PowermgtRequest_ID: return "PowermgtRequest";
+  case ReassocRequest_ID: return "ReassocRequest";
+  case ScanRequest_ID: return "ScanRequest";
+  case SetRequest_ID: return "SetRequest";
+  case StartRequest_ID: return "StartRequest";
+  case MdRequest_ID: return "MdRequest";
+  case ResyncRequest_ID: return "ResyncRequest";
+  case SiteRequest_ID: return "SiteRequest";
+  case SaveRequest_ID: return "SaveRequest";
+  case RFtestRequest_ID: return "RFtestRequest";
+  case MmConfirm_ID: return "MmConfirm";
+  case MmIndicate_ID: return "MmIndicate";
+  default:
+    {
+      static char buf[5];
+      sprintf(buf,"<%02x>",sigid);
+      return buf;
+    }
   } /* switch (sigid) */
 } /* sigid2str */
 #endif //#if TRACE_NR_RECS > 0
@@ -1044,7 +1068,7 @@ static void newstate(struct _wl24cb_t *cb, State_fct_t new_state)
   if (cb->state != new_state) {
 
 #if TRACE_NR_RECS > 0
-      if (cb->trace_mask & (1 << TRACE_NEW_STATE)) {
+    if (cb->trace_mask & (1 << TRACE_NEW_STATE)) {
       uint8 buf[2];
       buf[0] = state2id(cb->state);
       buf[1] = state2id(new_state);
@@ -1093,7 +1117,7 @@ static inline int disable_card_interrupt(WL24Cb_t *cb)
 
 #ifdef LOG_DISABLE_INTERRUPT
   printk(KERN_DEBUG "%s: %s: GCR old x%02x  new x%02x\n", cb->name, __FUNCTION__,
-	 old, InB(cb->BaseAddr+NIC_GCR));
+         old, InB(cb->BaseAddr+NIC_GCR));
 #endif
   return old & GCR_ENECINT;
 }
@@ -1105,7 +1129,7 @@ static inline void  enable_card_interrupt(WL24Cb_t *cb)
   OutB(InB(cb->BaseAddr + NIC_GCR) | GCR_ENECINT, cb->BaseAddr + NIC_GCR);
 #ifdef LOG_ENABLE_INTERRUPT
   printk(KERN_DEBUG "%s: %s: GCR x%02x\n", cb->name, __FUNCTION__,
-	 InB(cb->BaseAddr+NIC_GCR));
+         InB(cb->BaseAddr+NIC_GCR));
 #endif
 }
 
@@ -1199,7 +1223,7 @@ static void copy_from_card(void *dest, CardAddr_t src,
 
 #ifdef LOG_COPY_PROCS
   printk(KERN_DEBUG "%s %s(%p,%x,%x,%d,..)\n",
-	 cb->name, __FUNCTION__, dest, src, size, slow);
+         cb->name, __FUNCTION__, dest, src, size, slow);
 #endif
 
   OutB(page, cb->BaseAddr+NIC_BSS);
@@ -1222,11 +1246,11 @@ static void copy_from_card(void *dest, CardAddr_t src,
    copies sz many byte from src (host address space) to 
    dest (card address space). Protect outside against interrupt ! */
 static inline void copy_to_card(CardAddr_t dest, void *src, 
-                  int sz, WL24Cb_t *cb)
+                                int sz, WL24Cb_t *cb)
 {
 #ifdef LOG_COPY_PROCS
   printk(KERN_DEBUG "%s %s(%x,%p,%x,..)\n",
-	 cb->name, __FUNCTION__, dest, src, sz);
+         cb->name, __FUNCTION__, dest, src, sz);
 #endif
 
   OutB((dest&CARDADDR_MASK_PAGE)>>16,  cb->BaseAddr+NIC_BSS);
@@ -1246,12 +1270,12 @@ static inline void copy_to_card(CardAddr_t dest, void *src,
    dest (card address space). Protect outside against interrupt ! 
    Obey endians: card has little endian in byte-order */
 static inline void copy_words_to_card(CardAddr_t dest, uint16 const *src, 
-                  size_t size, WL24Cb_t *cb)
+                                      size_t size, WL24Cb_t *cb)
 {
   size_t sz = size;
 #ifdef LOG_COPY_PROCS
-    printk(KERN_DEBUG "%s %s(%x, %p, %x,..)\n",
-	   cb->name, __FUNCTION__, dest, src, sz);
+  printk(KERN_DEBUG "%s %s(%x, %p, %x,..)\n",
+         cb->name, __FUNCTION__, dest, src, sz);
 #endif
 
   OutB((dest&CARDADDR_MASK_PAGE)>>16,  cb->BaseAddr+NIC_BSS);
@@ -1273,13 +1297,13 @@ static inline void copy_words_to_card(CardAddr_t dest, uint16 const *src,
    dest (host address space). Protect outside against interrupt ! 
    Obey endians: card has little endian in byte-order */
 static inline void copy_words_from_card(uint16 *dest, CardAddr_t src,
-                  size_t sz, WL24Cb_t *cb)
+                                        size_t sz, WL24Cb_t *cb)
 {
   uint8 lower;
   int i;
 #ifdef LOG_COPY_PROCS
   printk(KERN_DEBUG "%s %s(%p,%x,%x,..)\n",
-	 cb->name, __FUNCTION__, dest, src, sz);
+         cb->name, __FUNCTION__, dest, src, sz);
 #endif
 
   OutB((src&CARDADDR_MASK_PAGE)>>16,  cb->BaseAddr+NIC_BSS);
@@ -1312,11 +1336,11 @@ static void init_esbq_txbuf(WL24Cb_t *cb)
 
 #ifdef LOG_INIT_ESBQ_TXBUF
   printk(KERN_DEBUG "%s: %s: selftest x%04x ESBQReqStartAddr x%04x ESBQReqSize x%04x\n",
-	 cb->name, __FUNCTION__, bufinfo.selftest, bufinfo.ESBQReqStartAddr, bufinfo.ESBQReqSize);
+         cb->name, __FUNCTION__, bufinfo.selftest, bufinfo.ESBQReqStartAddr, bufinfo.ESBQReqSize);
   printk(KERN_DEBUG "%s: %s: ESBQCfmStartAddr x%04x ESBQCfmSize x%04x\n",
-	 cb->name, __FUNCTION__, bufinfo.ESBQCfmStartAddr, bufinfo.ESBQCfmSize);
+         cb->name, __FUNCTION__, bufinfo.ESBQCfmStartAddr, bufinfo.ESBQCfmSize);
   printk(KERN_DEBUG "%s: %s: TxBufHead x%04x TxBufSize x%04x\n",
-	 cb->name, __FUNCTION__, bufinfo.TxBufHead, bufinfo.TxBufSize);
+         cb->name, __FUNCTION__, bufinfo.TxBufHead, bufinfo.TxBufSize);
 #endif
 
   cb->ESBQReqHead = cb->ESBQReqTail = cb->ESBQReqStart = 
@@ -1354,8 +1378,8 @@ static void init_esbq_txbuf(WL24Cb_t *cb)
 
 #ifdef LOG_INIT_ESBQ_TXBUF
   printk(KERN_DEBUG "%s %s: FreeTxBufList x%04x FreeTxBufTail x%04x FreeTxBufLen x%x\n",
-	 cb->name, __FUNCTION__, cb->FreeTxBufList, cb->FreeTxBufTail,
-	 cb->FreeTxBufLen);
+         cb->name, __FUNCTION__, cb->FreeTxBufList, cb->FreeTxBufTail,
+         cb->FreeTxBufLen);
 #endif
 
 #ifdef CHECK_ALLOC_TXBUF
@@ -1384,18 +1408,18 @@ static void read_flash_params(WL24Cb_t *cb)
 
   if (cb->Channel == 0 || cb->Channel > 32 || (!(cb->frdesc->channel_map & (1L<<(cb->Channel-1))))) {
     printk(KERN_INFO "%s: %s: Channel %d not allowed in domain %s, using %d instead\n",
-	   cb->name, __FUNCTION__, cb->Channel, cb->frdesc->name, cb->frdesc->default_ch);
+           cb->name, __FUNCTION__, cb->Channel, cb->frdesc->name, cb->frdesc->default_ch);
     cb->Channel = cb->frdesc->default_ch;
   }
 
 #ifdef LOG_FREQDOMAIN
   printk(KERN_DEBUG "%s: %s: freq. domain %s: channel_map x%08x\n",
-	 cb->name, __FUNCTION__, cb->frdesc->name, cb->frdesc->channel_map);
+         cb->name, __FUNCTION__, cb->frdesc->name, cb->frdesc->channel_map);
 
 #endif
 
   { /* firmware is a little endian 16 bit word, but we don't have
-        a copy_word_from_card with slow access (for flash ??)*/
+       a copy_word_from_card with slow access (for flash ??)*/
     copy_from_card(&cb->FWversion, WL_FW_VERSION, 2, COPY_SLOW, cb);
   }
 }
@@ -1451,10 +1475,10 @@ int restart_card(WL24Cb_t *cb)
     
   netif_carrier_off(cb->netdev); /* disable running netdevice watchdog */
   netif_stop_queue(cb->netdev); /* this proc might be called from 
-				   somewhere in state_* */
+                                   somewhere in state_* */
 
-   printk(KERN_DEBUG "%s: restart_card, base x%x\n",
-          cb->name, cb->BaseAddr);
+  printk(KERN_DEBUG "%s: restart_card, base x%x\n",
+         cb->name, cb->BaseAddr);
 
   /* reset */
   OutB_P(GCR_CORESET, cb->BaseAddr + NIC_GCR);
@@ -1474,12 +1498,20 @@ int restart_card(WL24Cb_t *cb)
   for (i = 0; i < 100; i++) {
     copy_from_card(&cTmp, WL_SELFTEST_ADDR, 1, COPY_SLOW, cb);
 #ifdef LOG_RESTART_CARD
-  printk(KERN_DEBUG "%s: restart_card: read x%02x @ x%04x\n",
-          cb->name, cTmp, WL_SELFTEST_ADDR);
+    printk(KERN_DEBUG "%s: restart_card: read x%02x @ x%04x\n",
+           cb->name, cTmp, WL_SELFTEST_ADDR);
 #endif
     if (cTmp == 'W') {
       /* firmware has completed all tests successfully */
-      cTmp = 'A';
+
+			read_flash_params(cb); // MAC addr, fw version, freq domain
+
+			/* is the transparent mode available ? */
+			cb->cardmode = ((cb->FWversion[0] == 2) && (cb->FWversion[1] >= 6)) ? 'H' : 'A';
+
+      printk(KERN_DEBUG "%s:using card mode %c (%d)\n", cb->name,
+						 cb->cardmode, cb->cardmode);
+      cTmp = cb->cardmode; /* 'A' resp. 'H' */
       copy_to_card(WL_SELFTEST_ADDR, &cTmp, 1, cb); 
       break;
     }
@@ -1491,11 +1523,9 @@ int restart_card(WL24Cb_t *cb)
     return FALSE;
   }
 
-  init_esbq_txbuf(cb); /* get the ESBQ / FreeTxBuf pointers */
-  init_scanlist(cb); /* init. cb-> vars for initial scan */
-
-  read_flash_params(cb); // MAC addr, fw version, freq domain
-
+	init_esbq_txbuf(cb); /* get the ESBQ / FreeTxBuf pointers */
+	init_scanlist(cb); /* init. cb-> vars for initial scan */
+			
   /* copy the MAC address into the net_device struct */
   memcpy(cb->netdev->dev_addr,cb->MacAddress,sizeof(cb->netdev->dev_addr));
 
@@ -1507,8 +1537,8 @@ int restart_card(WL24Cb_t *cb)
            "firmware version %d.%d (date %s)\n",cb->name,
            cb->MacAddress[0],cb->MacAddress[1],cb->MacAddress[2],
            cb->MacAddress[3],cb->MacAddress[4],cb->MacAddress[5],
-	   cb->frdesc->name, cb->FreqDomain,
-	   cb->FWversion[0],cb->FWversion[1],
+           cb->frdesc->name, cb->FreqDomain,
+           cb->FWversion[0],cb->FWversion[1],
            cb->FirmwareDate);
   }
 
@@ -1555,7 +1585,7 @@ Card_Word_t alloc_txbuf(WL24Cb_t *cb, size_t sz)
     do {
 
 #ifdef CHECK_ALLOC_TXBUF
-    dbg_txbuf_mark(cb,next,1,retval); /* mark the buffer as used, no parent */
+      dbg_txbuf_mark(cb,next,1,retval); /* mark the buffer as used, no parent */
 #endif
 
       prev = next;
@@ -1567,7 +1597,7 @@ Card_Word_t alloc_txbuf(WL24Cb_t *cb, size_t sz)
     } while (sz > 0 && next != 0);
 
     /* cb->FreeTxBufLen showed the wrong number or the free list got
-     incosistent */
+       incosistent */
     assert(sz == 0);
 
     /* cross check length and number of buffers */
@@ -1582,7 +1612,7 @@ Card_Word_t alloc_txbuf(WL24Cb_t *cb, size_t sz)
 #ifdef LOG_ALLOC_TXBUF
   printk(KERN_DEBUG "%s: %s(%x) -> %x\n", cb->name, __FUNCTION__, len, retval);
   printk(KERN_DEBUG "%s: FreeTxBuf list %x len %x tail %x\n", cb->name,
-	 cb->FreeTxBufList, cb->FreeTxBufLen, cb->FreeTxBufTail);
+         cb->FreeTxBufList, cb->FreeTxBufLen, cb->FreeTxBufTail);
 #endif
 
 #ifdef CHECK_ALLOC_TXBUF
@@ -1594,18 +1624,18 @@ Card_Word_t alloc_txbuf(WL24Cb_t *cb, size_t sz)
     int i;
 #if 0
     printk(KERN_DEBUG "%s: %s need %d buffer, have only %d\n", cb->name,
-	   __FUNCTION__,
-	   (len+CARD_TXBUF_DATA_SIZE-1)/CARD_TXBUF_DATA_SIZE, cb->FreeTxBufLen);
+           __FUNCTION__,
+           (len+CARD_TXBUF_DATA_SIZE-1)/CARD_TXBUF_DATA_SIZE, cb->FreeTxBufLen);
 #endif
     for(i=0; i < (cb->FreeTxBufEnd - cb->FreeTxBufStart) / 
-	          sizeof(Card_TxBuf_t); i++) {
+          sizeof(Card_TxBuf_t); i++) {
       Card_Word_t addr = cb->FreeTxBufStart + i*sizeof(Card_TxBuf_t);
       if (cb->dbg_txbuf[i].used && 
-	  (cb->dbg_txbuf[i].jiffies < (jiffies - TIME_THRESHOLD)))
-	printk(KERN_DEBUG "%s: %s buf @ x%x long time since alloc %lu,"
-	       " parent x%x, sigid x%x\n", 
-	       cb->name, __FUNCTION__, addr, jiffies - cb->dbg_txbuf[i].jiffies,
-	       cb->dbg_txbuf[i].parent, cb->dbg_txbuf[i].sigid);
+          (cb->dbg_txbuf[i].jiffies < (jiffies - TIME_THRESHOLD)))
+        printk(KERN_DEBUG "%s: %s buf @ x%x long time since alloc %lu,"
+               " parent x%x, sigid x%x\n", 
+               cb->name, __FUNCTION__, addr, jiffies - cb->dbg_txbuf[i].jiffies,
+               cb->dbg_txbuf[i].parent, cb->dbg_txbuf[i].sigid);
     }
   }
 #endif
@@ -1656,11 +1686,11 @@ void free_txbuf(WL24Cb_t *cb, Card_Word_t buf)
     copy_words_to_card(cb->FreeTxBufTail, &addr, 1,cb);
     /* dump buffers in free list */
     printk(KERN_WARNING "%s: %s FreeTxBuf list x%x len x%x tail x%x, dumping the chain:\n", cb->name,
-	   __FUNCTION__, cb->FreeTxBufList, cb->FreeTxBufLen, cb->FreeTxBufTail);
+           __FUNCTION__, cb->FreeTxBufList, cb->FreeTxBufLen, cb->FreeTxBufTail);
     addr = cb->FreeTxBufList;
     while (addr != 0) {
       if (!check_buf_addr(cb, "", "", addr))
-	break;
+        break;
       copy_words_from_card(&next, addr, 1,cb);
       printk(KERN_WARNING "%s: buf x%x next x%x\n", cb->name, addr, next);
       addr = next;
@@ -1684,7 +1714,7 @@ void free_txbuf(WL24Cb_t *cb, Card_Word_t buf)
 
 #ifdef LOG_FREE_TXBUF
   printk(KERN_DEBUG "%s: %s: leaving with FreeTxBuf list x%x len x%x tail x%x\n", cb->name,
-	 __FUNCTION__, cb->FreeTxBufList, cb->FreeTxBufLen, cb->FreeTxBufTail);
+         __FUNCTION__, cb->FreeTxBufList, cb->FreeTxBufLen, cb->FreeTxBufTail);
 #endif
 } /* end of free_txbuf */
 
@@ -1695,7 +1725,7 @@ void free_txbuf(WL24Cb_t *cb, Card_Word_t buf)
    to be processed by the driver */
 typedef struct {
   Card_Word_t buf; /* a linked list of tx/rx buffer 
-                          containing the request/confirm */
+                      containing the request/confirm */
   Card_Word_t owner; /* bit 15 is set if the driver owns the esbq */
 } PACKED Card_ESBQ_t;
 
@@ -1722,8 +1752,8 @@ void read_rxbuf(WL24Cb_t *cb, void *dest_addr, uint16 len, Card_Word_t rxbuf,
   uint8 *dst = dest_addr;
 
 #ifdef LOG_READ_RXBUF
-      printk(KERN_DEBUG "%s %s:  len x%x rxbuf x%x skip x%x\n", 
-	     cb->name, __FUNCTION__, len, rxbuf, skip);
+  printk(KERN_DEBUG "%s %s:  len x%x rxbuf x%x skip x%x\n", 
+         cb->name, __FUNCTION__, len, rxbuf, skip);
 #endif
 
   do {
@@ -1772,9 +1802,9 @@ int request_to_card(WL24Cb_t *cb, void *ReqBuf, size_t ReqSz)
     
 #if 0 // this is rather normal under heavy traffic !
     printk(KERN_WARNING "%s: cannot alloc txbuf of %d byte\n",
-	   cb->name, ReqSz);
+           cb->name, ReqSz);
     printk(KERN_DEBUG "%s: FreeTxBuf: List x%x Tail x%x Len x%x\n",
-	   cb->name, cb->FreeTxBufList, cb->FreeTxBufTail, cb->FreeTxBufLen);
+           cb->name, cb->FreeTxBufList, cb->FreeTxBufTail, cb->FreeTxBufLen);
 #endif
     return FALSE;
   }
@@ -1814,14 +1844,14 @@ void free_requests(WL24Cb_t *cb)
   Card_ESBQ_t req;
 #ifdef LOG_FREE_REQUESTS
   printk(KERN_DEBUG "%s: %s: ESBQ head %x tail %x\n",
-	 cb->name, __FUNCTION__, cb->ESBQReqHead, cb->ESBQReqTail);
+         cb->name, __FUNCTION__, cb->ESBQReqHead, cb->ESBQReqTail);
 #endif
 
   while (cb->ESBQReqTail != cb->ESBQReqHead) {
     copy_words_from_card((uint16 *)&req, cb->ESBQReqTail, SZ_ESBQ_W, cb);
 #ifdef LOG_FREE_REQUESTS
     printk(KERN_DEBUG "%s: %s: ESBQ @ %x: owner %x buf %x\n",
-	   cb->name, __FUNCTION__, cb->ESBQReqTail, req.owner, req.buf);
+           cb->name, __FUNCTION__, cb->ESBQReqTail, req.owner, req.buf);
 #endif
 
     if (req.owner & ESBQ_OWNED_BY_DRV) {
@@ -1920,15 +1950,32 @@ int TxDataReq(WL24Cb_t *cb, void *vsrc, uint16 len, LLCType_t llctype)
   uint8 *src = vsrc;
   Card_Word_t dbuf; /* here go the data from src with a TxHeader_t in front */
   MdReq_t Req;
-  uint16 off2write; /* offset into data[] of the current Card_TxBuf_t
-                       to write next chunk of frame data to */
-  uint16 templen; /* stores length to write to current Card_TxBuf_t */
+
+  int ThisLen, RestLen;
+  uint16 ptr;
+  uint8 *pBuffer;
+
+  /* copy the data to the temp buffer.  assure enough space at beginning 
+     for header conversion. */
+
+  wl24fill(&cb->databuffer, vsrc, len, 32);
+
+  /* convert to 802.11 */
+
+  wl24pack(&cb->databuffer, llctype,
+           cb->BSSset[cb->currBSS].CapabilityInfo & 1,
+           cb->BSSset[cb->currBSS].BSSID);
+
+  /* encrypt ? */
+
+  if (cb->wepstate.encrypt)
+    wl24encrypt(&cb->databuffer, &cb->wepstate);
 
   /* we might alloc too much, 'cause the len input parameter includes the dest/src
      MAC address which are removed from the payload for Wavelan.
      Otherwise we might decide to add 6 byte SNAP encapsulation there.
      For IEEE802_11 the length is correct ! */
-  dbuf = alloc_txbuf(cb,len+sizeof(TxHeader_t));
+  dbuf = alloc_txbuf(cb, cb->databuffer.length + sizeof(TxHeader_t));
   if (dbuf == 0)
     return FALSE;
 
@@ -1945,54 +1992,32 @@ int TxDataReq(WL24Cb_t *cb, void *vsrc, uint16 len, LLCType_t llctype)
   memcpy(Req.DAddress, src, sizeof(Req.DAddress)+sizeof(Req.SAddress));
 
 #ifdef LOG_TXDATAREQ_INCOMING
-    printk(KERN_DEBUG "%s: %s: in ",cb->name, __FUNCTION__);
-    dumpk(src,MIN(len,32));
-    printk("\n");
+  printk(KERN_DEBUG "%s: %s: in ",cb->name, __FUNCTION__);
+  dumpk(src,MIN(len,32));
+  printk("\n");
 #endif
 
-  if (llctype == LLCType_WaveLan) {
+  /* copy in frame, starting at FrameControl field in 802.11
+     header.  Note the 802.11 header will be overwritten by the card
+     in case we do not work in transparent mode */ 
 
-    /* remove MAC addresses from payload */
-    src += sizeof(Req.DAddress)+sizeof(Req.SAddress);
-    len -= sizeof(Req.DAddress)+sizeof(Req.SAddress);
-
-    if (((*src)*256+*(src+1)) > 1500) {
-      /* a protocol id follows to the MAC addresses 
-         -> we add SNAP encapsulation of 6 byte length */
-      static const uint8 snap_prefix[] = {0xaa, 0xaa, 3, 0, 0, 0};
-      Req.Size = len + TXHEADER_HEADER_SIZE + sizeof(snap_prefix);
-      copy_to_card(dbuf+offsetof(Card_TxBuf_t,data)+sizeof(TxHeader_t),
-                   &snap_prefix, sizeof(snap_prefix),cb);
-      /* where shall we write the next data to (excl. the +2 for the
-         next field */
-      off2write = sizeof(TxHeader_t)+sizeof(snap_prefix);
-
-    } else {
-
-      /* a length field follows the MAC addresses in src -> we skip it */
-      src += 2;
-      len -= 2;
-      Req.Size = len + TXHEADER_HEADER_SIZE;
-      off2write = sizeof(TxHeader_t);
+  RestLen = cb->databuffer.length;
+  pBuffer = cb->databuffer.buffer + cb->databuffer.offset;
+  ThisLen = min(RestLen, 204 + 24);
+  copy_to_card(dbuf + 28, pBuffer, ThisLen, cb);
+  pBuffer += ThisLen; RestLen -= ThisLen;
+  copy_words_from_card(&ptr, dbuf, 1, cb);
+  while (RestLen)
+    {
+      ThisLen = min(RestLen, 254);
+      copy_to_card(ptr + 2, pBuffer, ThisLen, cb);
+      pBuffer += ThisLen; RestLen -= ThisLen;
+      copy_words_from_card(&ptr, ptr, 1, cb);
     }
-  } else {
-    /* llctype is IEEE_802_11 */
-    Req.Size = len + TXHEADER_HEADER_SIZE;
-    off2write = sizeof(TxHeader_t);
-  }
 
-  do {
-    templen = MIN(CARD_TXBUF_DATA_SIZE-off2write,
-                  len);
-    len -= templen;
-    
-    assert(dbuf != 0);
-    copy_to_card(dbuf+offsetof(Card_TxBuf_t,data)+off2write, src, 
-                 templen, cb);
-    src += templen;
-    copy_words_from_card(&dbuf, dbuf, 1, cb);
-    off2write = 0; /* was != 0 only for the first round */
-  } while (len > 0);
+  /* Tx size is 802.11 frame's length, including FCS */
+
+  Req.Size = cb->databuffer.length + 4;
 
   if ((cb->dbg_mask & DBG_MSG_TO_CARD) &&
       (cb->msg_to_dbg_mask & DBG_TXDATA_REQ)) {
@@ -2008,15 +2033,15 @@ int TxDataReq(WL24Cb_t *cb, void *vsrc, uint16 len, LLCType_t llctype)
       uint8 buf[32];
       int i;
       copy_from_card(buf, le16_to_cpu(Req.Data)+
-		          offsetof(Card_TxBuf_t,data)+sizeof(TxHeader_t),
-		     sizeof(buf),
-		     COPY_FAST, cb);
+                     offsetof(Card_TxBuf_t,data)+sizeof(TxHeader_t),
+                     sizeof(buf),
+                     COPY_FAST, cb);
       printk(KERN_DEBUG "%s: Tx Data ", cb->name);
       for(i=0; i < sizeof(buf); i++) printk("%02x",buf[i]);
       printk("\n");
     }
   }
- /* send the request */
+  /* send the request */
   if (!request_to_card(cb,&Req,sizeof(Req))) {
     /* free appended tx data buffer */
     free_txbuf(cb, le16_to_cpu(Req.Data));
@@ -2125,10 +2150,10 @@ void wl24n_card_stop(void *priv)
    init. the cb and sends first request to card.
    Returns pointer to WL24Cb_t structure passed in later calls to (?) */
 void *wl24n_card_init(uint32 dbg_mask, uint32 msg_to_dbg_mask,
-                uint32 msg_from_dbg_mask,
-                int BaseAddr, int irq, LLCType_t llctype, 
-                BSSType_t bsstype, uint8 *essid,
-                uint8 Channel, int *open_counter, char **dev_name, uint32 trace_mask)
+                      uint32 msg_from_dbg_mask,
+                      int BaseAddr, int irq, LLCType_t llctype, 
+                      BSSType_t bsstype, uint8 *essid, int essid_len,
+                      uint8 Channel, int *open_counter, char **dev_name, uint32 trace_mask)
 {
 
   WL24Cb_t *cb = kmalloc(sizeof(WL24Cb_t), GFP_KERNEL);
@@ -2174,7 +2199,7 @@ void *wl24n_card_init(uint32 dbg_mask, uint32 msg_to_dbg_mask,
   sema_init(&cb->ioctl_mutex,1);
   /* init netdevice 
      original sw: in wl24_cs.c 
-  but we want to hide as much as possible from the PCMCIA part */
+     but we want to hide as much as possible from the PCMCIA part */
 
   cb->netdev->priv = cb; /* to get the cb in wl24_tx(),wl24n_open(),... */
 
@@ -2211,7 +2236,7 @@ void *wl24n_card_init(uint32 dbg_mask, uint32 msg_to_dbg_mask,
 
   /* input essid is a simple string, convert it into TLV */
   cb->ESSID[0] = IE_ID_SSID;
-  cb->ESSID[1] = MIN(strlen(essid),sizeof(cb->ESSID)-(1+1)-1);
+  cb->ESSID[1] = MIN(essid_len,sizeof(cb->ESSID)-(1+1)-1);
   memcpy(cb->ESSID+2, essid, cb->ESSID[1]);
   cb->ESSID[1+1+cb->ESSID[1]] = '\0'; /* make it a C string */
   cb->Channel = Channel;
@@ -2247,6 +2272,12 @@ void *wl24n_card_init(uint32 dbg_mask, uint32 msg_to_dbg_mask,
   memcpy(cb->nickname,cb->name,i);
   cb->nickname[i] = '\0';
 
+  /* no WEP by default, but initialize the IV counter to a
+     pseudo-random value */
+
+  memset(&(cb->wepstate), 0, sizeof(cb->wepstate));
+  cb->wepstate.ivval = jiffies;
+
 #if IW_MAX_SPY > 0
   cb->iwspy_number = 0;
 #endif
@@ -2272,7 +2303,7 @@ int wl24n_init(struct net_device *dev)
 /* == PROC wl24n_set_multicast_list == */
 static void wl24n_set_multicast_list (struct net_device *dev)
      __attribute__((unused));
-static void wl24n_set_multicast_list (struct net_device *dev)
+     static void wl24n_set_multicast_list (struct net_device *dev)
 {
   WL24Cb_t *cb = dev->priv;
 
@@ -2300,7 +2331,7 @@ int wl24n_open(struct net_device *dev)
 #if 0 // we do this in mc2_config ...
   if ((ret=request_irq(dev->irq, wl24n_interrupt, 0, "mc2", dev)) < 0) {
     printk(KERN_WARNING "%s: cannot alloc irq %d, errno %d\n",
-	   cb->name, dev->irq, ret);
+           cb->name, dev->irq, ret);
     return ret;
   }
 #endif
@@ -2323,7 +2354,7 @@ int wl24n_close(struct net_device *dev)
 
   /* let the card service try to close the device first
      (look if it is a valid device, if a release was pending
-      (DEV_STALE_CONFIG set in link->state), etc. */
+     (DEV_STALE_CONFIG set in link->state), etc. */
   rc = wl24n_cs_close(cb);
 
   if (rc < 0)
@@ -2389,7 +2420,7 @@ void wl24n_watchdog(struct net_device *dev)
     copy_words_from_card((uint16 *)&cfm, cb->ESBQCfm, 2, cb);
     copy_from_card(&sig, cfm.buf+2, 1, COPY_FAST, cb);
     printk(KERN_DEBUG "%s: GCR %02x ESBQCfm x%04x: owner %x buf %x signal %x\n",
-	   cb->name, InB(cb->BaseAddr+NIC_GCR), cb->ESBQCfm, cfm.owner, cfm.buf, sig);
+           cb->name, InB(cb->BaseAddr+NIC_GCR), cb->ESBQCfm, cfm.owner, cfm.buf, sig);
   }
 #endif
 
@@ -2403,15 +2434,15 @@ void wl24n_watchdog(struct net_device *dev)
 #endif
 
 #ifdef RESET_ON_TX_TIMEOUT
-    printk(KERN_WARNING "%s: tx timeout - resetting card!\n",cb->name);
+  printk(KERN_WARNING "%s: tx timeout - resetting card!\n",cb->name);
 
-    if (!restart_card(cb))
-      printk(KERN_WARNING "%s: reset_card failed\n", cb->name);
-    else {
-      printk(KERN_DEBUG "%s: %s: Forced hard reset\n", cb->name, __FUNCTION__);
-    }
+  if (!restart_card(cb))
+    printk(KERN_WARNING "%s: reset_card failed\n", cb->name);
+  else {
+    printk(KERN_DEBUG "%s: %s: Forced hard reset\n", cb->name, __FUNCTION__);
+  }
 #else
-    printk(KERN_WARNING "%s: tx timeout - ignored.\n",cb->name);
+  printk(KERN_WARNING "%s: tx timeout - ignored.\n",cb->name);
 #endif
 
 } /* end of wl24n_watchdog */
@@ -2467,7 +2498,6 @@ int hw_mib(WL24Cb_t *cb, int attr, void *val, size_t sz, int is_set_cmd)
    returns 0 for failure, != 0 otherwise */
 int hw_getbssid(WL24Cb_t *cb, void *dst)
 {
-  static const uint8 zeros[ETH_ALEN] = {0,0,0,0,0,0};
   uint8 *bssid = (uint8 *)zeros;
 
   if (cb->state == state_joining || cb->state == state_assoc ||
@@ -2511,7 +2541,7 @@ static int mc2_ioctl_setspy(WL24Cb_t *cb, struct iw_point *srq)
 
   if (cb->dbg_mask & DBG_DEV_CALLS)
     printk(KERN_DEBUG "%s: ioctl(SIOCSIWSPY, number %d)\n", 
-	   cb->name, number);
+           cb->name, number);
   /* Check the number of addresses */
   if (number > IW_MAX_SPY)
     return -E2BIG;
@@ -2519,7 +2549,7 @@ static int mc2_ioctl_setspy(WL24Cb_t *cb, struct iw_point *srq)
   /* Get the data in the driver */
   if (srq->pointer) {
     if (copy_from_user(address, srq->pointer,
-		       sizeof(struct sockaddr) * number))
+                       sizeof(struct sockaddr) * number))
       return -EFAULT;
   }
 
@@ -2529,7 +2559,7 @@ static int mc2_ioctl_setspy(WL24Cb_t *cb, struct iw_point *srq)
     /* Extract the addresses */
     for (i = 0; i < number; i++) {
       memcpy(cb->iwspy[i].spy_address, address[i].sa_data,
-	     ETH_ALEN);
+             ETH_ALEN);
       /* Reset stats */
       cb->iwspy[i].spy_level = cb->iwspy[i].updated = 0;
     }
@@ -2543,10 +2573,10 @@ static int mc2_ioctl_setspy(WL24Cb_t *cb, struct iw_point *srq)
     printk(KERN_DEBUG "%s: New spy list:\n", cb->name);
     for (i = 0; i < number; i++) {
       printk(KERN_DEBUG "%s: %d - %02x:%02x:%02x:%02x:%02x:%02x\n",
-	     cb->name, i,
-	     cb->iwspy[i].spy_address[0], cb->iwspy[i].spy_address[1],
-	     cb->iwspy[i].spy_address[2], cb->iwspy[i].spy_address[3],
-	     cb->iwspy[i].spy_address[4], cb->iwspy[i].spy_address[5]);
+             cb->name, i,
+             cb->iwspy[i].spy_address[0], cb->iwspy[i].spy_address[1],
+             cb->iwspy[i].spy_address[2], cb->iwspy[i].spy_address[3],
+             cb->iwspy[i].spy_address[4], cb->iwspy[i].spy_address[5]);
     }
   }
 
@@ -2564,7 +2594,7 @@ static int mc2_ioctl_getspy(WL24Cb_t *cb, struct iw_point *srq)
 
 	if (cb->dbg_mask & DBG_DEV_CALLS)
 	  printk(KERN_DEBUG "%s: ioctl(SIOCGIWSPY, number %d)\n", 
-	   cb->name, cb->iwspy_number);
+           cb->name, cb->iwspy_number);
 
 	number = cb->iwspy_number;
 
@@ -2572,7 +2602,7 @@ static int mc2_ioctl_getspy(WL24Cb_t *cb, struct iw_point *srq)
 	  /* Create address struct  and copy stats */
 	  for (i = 0; i < number; i++) {
 	    memcpy(address[i].sa_data, cb->iwspy[i].spy_address,
-		   ETH_ALEN);
+             ETH_ALEN);
 	    address[i].sa_family = AF_UNIX;
 	    /* ELSA MC-2: RSSI is not in dBm, no way to get noise and
 	       link quality ... */
@@ -2585,10 +2615,10 @@ static int mc2_ioctl_getspy(WL24Cb_t *cb, struct iw_point *srq)
 	  /* Push stuff to user space */
 	  srq->length = number;
 	  if(copy_to_user(srq->pointer, address,
-			  sizeof(struct sockaddr) * number))
+                    sizeof(struct sockaddr) * number))
 	    return -EFAULT;
 	  if(copy_to_user(srq->pointer + (sizeof(struct sockaddr)*number),
-			  &spy_stat, sizeof(struct iw_quality) * number))
+                    &spy_stat, sizeof(struct iw_quality) * number))
 	    return -EFAULT;
 	}
 	return 0;
@@ -2633,6 +2663,7 @@ int wl24n_ioctl(struct net_device *dev, struct ifreq *rq, int cmd)
   WL24Cb_t *cb = dev->priv;
   struct iwreq *wrq = (struct iwreq *) rq;
   int rc = 0;
+  int index;
   int need_commit = 0; /* gets set to 1 if we must tell the card
                           some changed params */
   // Frequency list (map channels to frequencies)
@@ -2654,33 +2685,33 @@ int wl24n_ioctl(struct net_device *dev, struct ifreq *rq, int cmd)
       int chan = NUM_CHANNELS+1;
 
       if (cb->dbg_mask & DBG_DEV_CALLS)
-	printk(KERN_DEBUG "%s: ioctl SIOCSIWFREQ, freq.e %u freq.m %u\n", 
-	       cb->name, wrq->u.freq.e, wrq->u.freq.m);
+        printk(KERN_DEBUG "%s: ioctl SIOCSIWFREQ, freq.e %u freq.m %u\n", 
+               cb->name, wrq->u.freq.e, wrq->u.freq.m);
 
       if (wrq->u.freq.e == 0 && wrq->u.freq.m <= 1000) {
-	chan = wrq->u.freq.m; // setting by channel
+        chan = wrq->u.freq.m; // setting by channel
       } else {
-	int mult = 1, i;
-	for(i=0; i < (6 - wrq->u.freq.e); i++)
-	  mult *= 10;
-	for(i=0; i < NUM_CHANNELS; i++)
-	  if (wrq->u.freq.m == frequency_list[i] * mult) {
-	    chan = i+1;
-	    break;
-	  }
+        int mult = 1, i;
+        for(i=0; i < (6 - wrq->u.freq.e); i++)
+          mult *= 10;
+        for(i=0; i < NUM_CHANNELS; i++)
+          if (wrq->u.freq.m == frequency_list[i] * mult) {
+            chan = i+1;
+            break;
+          }
       }
 
       if ((chan < 1) || (chan > NUM_CHANNELS) ||
-	  !(1<<(chan-1) & cb->frdesc->channel_map)) {
-	printk(KERN_DEBUG "%s: new channel value %d is invalid (e %u, m %d)\n", 
-	       cb->name, chan, wrq->u.freq.e, wrq->u.freq.m);
-	rc = -EINVAL;
+          !(1<<(chan-1) & cb->frdesc->channel_map)) {
+        printk(KERN_DEBUG "%s: new channel value %d is invalid (e %u, m %d)\n", 
+               cb->name, chan, wrq->u.freq.e, wrq->u.freq.m);
+        rc = -EINVAL;
       } else {
-	cb->Channel = chan;
-	need_commit = 1;
-	if (cb->dbg_mask & DBG_DEV_CALLS)
-	  printk(KERN_DEBUG "%s: ioctl SIOCSIWFREQ set new channel %d\n",
-		 cb->name, cb->Channel);
+        cb->Channel = chan;
+        need_commit = 1;
+        if (cb->dbg_mask & DBG_DEV_CALLS)
+          printk(KERN_DEBUG "%s: ioctl SIOCSIWFREQ set new channel %d\n",
+                 cb->name, cb->Channel);
       }
     }
     break;
@@ -2696,46 +2727,49 @@ int wl24n_ioctl(struct net_device *dev, struct ifreq *rq, int cmd)
 #endif
     if (cb->dbg_mask & DBG_DEV_CALLS)
       printk(KERN_DEBUG "%s: ioctl SIOCGIWFREQ -> freq.m %u freq.e %u\n", 
-	     cb->name, wrq->u.freq.m, wrq->u.freq.e);
+             cb->name, wrq->u.freq.m, wrq->u.freq.e);
     break;
 
     // Set desired network name (ESSID)
   case SIOCSIWESSID:
     if (cb->dbg_mask & DBG_DEV_CALLS)
-      printk(KERN_DEBUG "%s: ioctlSIOCSIWESSID, pointer %p flags %d length %d\n", 
-	     cb->name, wrq->u.data.pointer, wrq->u.data.flags, wrq->u.data.length);
+      printk(KERN_DEBUG "%s: ioctl SIOCSIWESSID, pointer %p flags %d length %d\n", 
+             cb->name, wrq->u.data.pointer, wrq->u.data.flags, wrq->u.data.length);
 
     if (wrq->u.data.pointer) {
       /* Check if we asked for `any' */
       if(wrq->u.data.flags == 0) {
-	cb->ESSID[0] = cb->ESSID[1] = cb->ESSID[2] = 0;
+        cb->ESSID[0] = cb->ESSID[1] = cb->ESSID[2] = 0;
       } else {
-	/* Check the size of the string */
-	if(wrq->u.data.length > IW_ESSID_MAX_SIZE + 1) {
-	  rc = -E2BIG;
-	  break;
-	}
-	if (copy_from_user(&cb->ESSID[2],
-			   wrq->u.data.pointer,
-			   wrq->u.data.length)) {
-	  rc = -EFAULT;
-	  break;
-	}
-	cb->ESSID[0] = 0;
-	cb->ESSID[1] = wrq->u.data.length;
+        /* Check the size of the string */
+        if(wrq->u.data.length > IW_ESSID_MAX_SIZE + 1) {
+          rc = -E2BIG;
+          break;
+        }
+        if (copy_from_user(&cb->ESSID[2],
+                           wrq->u.data.pointer,
+                           wrq->u.data.length)) {
+          rc = -EFAULT;
+          break;
+        }
+        cb->ESSID[0] = IE_ID_SSID;
+        cb->ESSID[1] = wrq->u.data.length;
 
-	/* strip a trailing '\0' in ESSID */
-	if (cb->ESSID[1] > 0 && cb->ESSID[2+cb->ESSID[1]-1] == '\0')
-	  cb->ESSID[1]--;
+        /* strip a trailing '\0' in ESSID */
+        if (cb->ESSID[1] > 0 && cb->ESSID[2+cb->ESSID[1]-1] == '\0')
+          cb->ESSID[1]--;
+        assert(cb->ESSID[1] <= IW_ESSID_MAX_SIZE);
+        if (cb->ESSID[1] > IW_ESSID_MAX_SIZE)
+          cb->ESSID[1] = IW_ESSID_MAX_SIZE;
+        cb->ESSID[2+cb->ESSID[1]] = '\0'; /* make it printable */
       }
       need_commit = 1;
       if (cb->dbg_mask & DBG_DEV_CALLS) {
-	printk(KERN_DEBUG "%s: ioctl SIOCSIWESSID set new ESSID %x %x: ",
-	       cb->name, cb->ESSID[0], cb->ESSID[1]);
-	dumpk(cb->ESSID+2, cb->ESSID[1]);
-	printk("\n");
+        printk(KERN_DEBUG "%s: ioctl SIOCSIWESSID set new ESSID (%d)%s (",
+               cb->name, cb->ESSID[1], cb->ESSID+2);
+        dumpk(cb->ESSID+2, cb->ESSID[1]);
+        printk(")\n");
       }
-
     }
     break;
 
@@ -2743,25 +2777,25 @@ int wl24n_ioctl(struct net_device *dev, struct ifreq *rq, int cmd)
   case SIOCGIWESSID:
     if (cb->dbg_mask & DBG_DEV_CALLS)
       printk(KERN_DEBUG "%s: ioctl SIOCGIWESSID, pointer %p\n", 
-	     cb->name, wrq->u.data.pointer);
+             cb->name, wrq->u.data.pointer);
     if (wrq->u.data.pointer) {
       uint8 *essid;
 
       /* Get the essid that was set */
       if (cb->ESSID[1] == 0 && cb->currBSS >= 0) {
-	assert(cb->currBSS < NR_BSS_DESCRIPTIONS && 
-	       cb->BSSset[cb->currBSS].valid);
+        assert(cb->currBSS < NR_BSS_DESCRIPTIONS && 
+               cb->BSSset[cb->currBSS].valid);
           
-	essid = cb->BSSset[cb->currBSS].SSID;
+        essid = cb->BSSset[cb->currBSS].SSID;
       } else
-	essid = cb->ESSID;
+        essid = cb->ESSID;
 
       wrq->u.data.length = MIN(essid[1],IW_ESSID_MAX_SIZE) + 1;
       wrq->u.data.flags = 1; /* active */
       if (wrq->u.data.pointer)
-	if (copy_to_user(wrq->u.data.pointer, essid+2, 
-			 wrq->u.data.length)) 
-	  rc = -EFAULT;
+        if (copy_to_user(wrq->u.data.pointer, essid+2, 
+                         wrq->u.data.length)) 
+          rc = -EFAULT;
     }
     break;
 
@@ -2772,7 +2806,7 @@ int wl24n_ioctl(struct net_device *dev, struct ifreq *rq, int cmd)
     if (!hw_getbssid(cb, wrq->u.ap_addr.sa_data)) {
       rc = -EFAULT;
       if (cb->dbg_mask & DBG_DEV_CALLS)
-	printk(KERN_DEBUG "%s: SIOCGIWAP returns -EFAULT\n", cb->name);
+        printk(KERN_DEBUG "%s: SIOCGIWAP returns -EFAULT\n", cb->name);
     } else
       wrq->u.ap_addr.sa_family = ARPHRD_ETHER;
     break;
@@ -2781,19 +2815,19 @@ int wl24n_ioctl(struct net_device *dev, struct ifreq *rq, int cmd)
   case SIOCSIWNICKN:
     if (cb->dbg_mask & DBG_DEV_CALLS)
       printk(KERN_DEBUG "%s: ioctl SIOCSIWNICKN, pointer %p, length %d\n", 
-	     cb->name, wrq->u.data.pointer, wrq->u.data.length);
+             cb->name, wrq->u.data.pointer, wrq->u.data.length);
     if (wrq->u.data.pointer) {
       if (wrq->u.data.length > IW_ESSID_MAX_SIZE)
-	rc = -E2BIG;
+        rc = -E2BIG;
       else {
-	char nbuf[IW_ESSID_MAX_SIZE+1];
-	if (copy_from_user(nbuf, wrq->u.data.pointer, 
-			   wrq->u.data.length))
-	  rc = -EFAULT;
-	else {
-	  memcpy(cb->nickname,nbuf,wrq->u.data.length);
-	  cb->nickname[wrq->u.data.length] = '\0';
-	}
+        char nbuf[IW_ESSID_MAX_SIZE+1];
+        if (copy_from_user(nbuf, wrq->u.data.pointer, 
+                           wrq->u.data.length))
+          rc = -EFAULT;
+        else {
+          memcpy(cb->nickname,nbuf,wrq->u.data.length);
+          cb->nickname[wrq->u.data.length] = '\0';
+        }
       }
     }
     break;
@@ -2802,10 +2836,10 @@ int wl24n_ioctl(struct net_device *dev, struct ifreq *rq, int cmd)
   case SIOCGIWNICKN:
     if (cb->dbg_mask & DBG_DEV_CALLS)
       printk(KERN_DEBUG "%s: ioctl SIOCSIWNICKN, pointer %p\n",
-	     cb->name, wrq->u.data.pointer);
+             cb->name, wrq->u.data.pointer);
     if (wrq->u.data.pointer) {
-	if (copy_to_user(wrq->u.data.pointer, cb->nickname, sizeof(cb->nickname)))
-	  rc = -EFAULT;
+      if (copy_to_user(wrq->u.data.pointer, cb->nickname, sizeof(cb->nickname)))
+        rc = -EFAULT;
     }
     break;
 
@@ -2816,14 +2850,14 @@ int wl24n_ioctl(struct net_device *dev, struct ifreq *rq, int cmd)
       Card_Word_t val;
 
       if (cb->dbg_mask & DBG_DEV_CALLS)
-	printk(KERN_DEBUG "%s: ioctl SIOCSIWRTS, value %d, disabled %d\n", 
-	       cb->name, wrq->u.rts.value, wrq->u.rts.disabled);
+        printk(KERN_DEBUG "%s: ioctl SIOCSIWRTS, value %d, disabled %d\n", 
+               cb->name, wrq->u.rts.value, wrq->u.rts.disabled);
 
       if(wrq->u.rts.disabled)
-	rthr = 2347;
+        rthr = 2347;
       if((rthr < 0) || (rthr > 2347)) {
-	rc = -EINVAL;
-	break;
+        rc = -EINVAL;
+        break;
       }
       val = cpu_to_le16(rthr);
       rc = hw_setmib(cb, aRTSThreshold, &val, sizeof(val));
@@ -2844,7 +2878,7 @@ int wl24n_ioctl(struct net_device *dev, struct ifreq *rq, int cmd)
   case SIOCSIWRATE:
     if (cb->dbg_mask & DBG_DEV_CALLS)
       printk(KERN_DEBUG "%s: ioctl SIOCSIWRATE, value %d, fixed %d\n", 
-	     cb->name, wrq->u.bitrate.value, wrq->u.bitrate.fixed);
+             cb->name, wrq->u.bitrate.value, wrq->u.bitrate.fixed);
     rc = -EOPNOTSUPP;
     break;
 
@@ -2868,18 +2902,18 @@ int wl24n_ioctl(struct net_device *dev, struct ifreq *rq, int cmd)
     {
       int fthr = wrq->u.frag.value;
       if (cb->dbg_mask & DBG_DEV_CALLS)
-	printk(KERN_DEBUG "%s: ioctl SIOCSIWFRAG, value %d, disabled %d\n", 
-	       cb->name, wrq->u.frag.value, wrq->u.frag.disabled);
+        printk(KERN_DEBUG "%s: ioctl SIOCSIWFRAG, value %d, disabled %d\n", 
+               cb->name, wrq->u.frag.value, wrq->u.frag.disabled);
 
       if(wrq->u.frag.disabled)
-	fthr = 2346;
+        fthr = 2346;
       if((fthr < 256) || (fthr > 2346)) {
-	rc = -EINVAL;
+        rc = -EINVAL;
       } else {
-	Card_Word_t val;
-	fthr &= ~0x1;	// Get an even value
-	val = cpu_to_le16(fthr);
-	rc = hw_setmib(cb, aFragmentationThreshold, &val, sizeof(val));
+        Card_Word_t val;
+        fthr &= ~0x1;	// Get an even value
+        val = cpu_to_le16(fthr);
+        rc = hw_setmib(cb, aFragmentationThreshold, &val, sizeof(val));
       }
     }
     break;
@@ -2904,7 +2938,7 @@ int wl24n_ioctl(struct net_device *dev, struct ifreq *rq, int cmd)
   case SIOCSIWMODE:
     if (cb->dbg_mask & DBG_DEV_CALLS)
       printk(KERN_DEBUG "%s: ioctl SIOCSIWMODE, mode %d\n", 
-	     cb->name, wrq->u.mode);
+             cb->name, wrq->u.mode);
 
     switch (wrq->u.mode) {
     case IW_MODE_ADHOC:
@@ -2919,10 +2953,10 @@ int wl24n_ioctl(struct net_device *dev, struct ifreq *rq, int cmd)
     need_commit = 1;
     if (cb->dbg_mask & DBG_DEV_CALLS)
       printk(KERN_DEBUG "%s: ioctl SIOCSIWMODE set new bsstype %s\n",
-	     cb->name,
-	     cb->bsstype == BSSType_Infrastructure ? "Infrastructure" : 
-	     cb->bsstype == BSSType_Independent ? "Independent" :
-	     "AnyBSS");
+             cb->name,
+             cb->bsstype == BSSType_Infrastructure ? "Infrastructure" : 
+             cb->bsstype == BSSType_Independent ? "Independent" :
+             "AnyBSS");
     break;
 
     // Get port type
@@ -2930,7 +2964,7 @@ int wl24n_ioctl(struct net_device *dev, struct ifreq *rq, int cmd)
     if (cb->dbg_mask & DBG_DEV_CALLS)
       printk(KERN_DEBUG "%s: ioctl SIOCGIWMODE\n", cb->name);
     wrq->u.mode = (cb->bsstype == BSSType_Infrastructure ? IW_MODE_INFRA :
-		   IW_MODE_ADHOC);
+                   IW_MODE_ADHOC);
     break;
 
     // Set the desired Power Management mode
@@ -2939,28 +2973,28 @@ int wl24n_ioctl(struct net_device *dev, struct ifreq *rq, int cmd)
   case SIOCSIWPOWER:
     if (cb->dbg_mask & DBG_DEV_CALLS)
       printk(KERN_DEBUG "%s: ioctl SIOCSIWPOWER, flags %d, disabled %d\n", 
-	     cb->name, wrq->u.power.flags, wrq->u.power.disabled);
+             cb->name, wrq->u.power.flags, wrq->u.power.disabled);
 #if 0
     // TODO: fill this out
     if(wrq->u.power.disabled) {
 
     } else {
 
-				// Check mode
+      // Check mode
       switch(wrq->u.power.flags & IW_POWER_MODE) {
       case IW_POWER_UNICAST_R:
-	break;
+        break;
       case IW_POWER_ALL_R:
-	break;
+        break;
       case IW_POWER_ON:	// None = ok
-	break;
+        break;
       default:	// Invalid
-	rc = -EINVAL;
+        rc = -EINVAL;
       }
-				// not supported 
+      // not supported 
       if ((wrq->u.power.flags & IW_POWER_PERIOD) ||
-	  (wrq->u.power.flags & IW_POWER_TIMEOUT))
-	rc = -EINVAL;	// Invalid
+          (wrq->u.power.flags & IW_POWER_TIMEOUT))
+        rc = -EINVAL;	// Invalid
     }
 #else
     rc = -EOPNOTSUPP;
@@ -2983,14 +3017,99 @@ int wl24n_ioctl(struct net_device *dev, struct ifreq *rq, int cmd)
   case SIOCSIWENCODE:
     if (cb->dbg_mask & DBG_DEV_CALLS)
       printk(KERN_DEBUG "%s: ioctl SIOCSIWENCODE\n", cb->name);
-    rc = -EOPNOTSUPP;
+
+#ifdef LOG_IWENCODE
+		printk(KERN_DEBUG "%s: old wepstate: encrypt %d txkeyid %d exclude_unencr %d\n",
+					 cb->name, cb->wepstate.encrypt, cb->wepstate.txkeyid,
+					 cb->wepstate.exclude_unencr);
+		printk(KERN_DEBUG "%s: siwencode: enc.flags %08x pointer %p len %d\n",
+					 cb->name, wrq->u.encoding.flags, 
+					 wrq->u.encoding.pointer, wrq->u.encoding.length);
+#endif
+
+    if (cb->cardmode != 'H')
+      {
+        rc = -EOPNOTSUPP;
+        goto out;
+      }
+
+    index = (wrq->u.encoding.flags & IW_ENCODE_INDEX) - 1;
+    if ((index < 0) || (index >= WEP_CNT))
+      index = index = cb->wepstate.txkeyid;
+
+    if (wrq->u.encoding.pointer)
+      {
+        int len = wrq->u.encoding.length;
+
+        if ((len < WEP_SMALL_KEY_SIZE) || (len > WEP_LARGE_KEY_SIZE)) {
+          rc = -EINVAL;
+          goto out;
+        }
+
+        memset(cb->wepstate.wepkeys[index].value, 0, 
+               sizeof(cb->wepstate.wepkeys[index].value));
+
+        if (copy_from_user(cb->wepstate.wepkeys[index].value, 
+                           wrq->u.encoding.pointer, len)) {
+          rc = -EFAULT;
+          goto out;
+        }
+
+        cb->wepstate.wepkeys[index].length = 
+          len > WEP_SMALL_KEY_SIZE ? WEP_LARGE_KEY_SIZE : WEP_SMALL_KEY_SIZE;
+
+#ifdef LOG_IWENCODE
+        printk(KERN_DEBUG "%s: new key index %d, len %d: ",
+               cb->name, index, cb->wepstate.wepkeys[index].length);
+        dumpk(cb->wepstate.wepkeys[index].value,cb->wepstate.wepkeys[index].length);
+        printk("\n");
+#endif
+
+        cb->wepstate.encrypt = 1;
+      }
+
+    cb->wepstate.txkeyid = index;
+    cb->wepstate.encrypt = ((wrq->u.encoding.flags & IW_ENCODE_DISABLED) == 0);
+    if (wrq->u.encoding.flags & IW_ENCODE_RESTRICTED)
+      cb->wepstate.exclude_unencr = 1;
+    if (wrq->u.encoding.flags & IW_ENCODE_OPEN)
+      cb->wepstate.exclude_unencr = 0;
+    rc = 0;
+
+#ifdef LOG_IWENCODE
+		printk(KERN_DEBUG "%s: new wepstate: encrypt %d txkeyid %d exclude_unencr %d\n",
+					 cb->name, cb->wepstate.encrypt, cb->wepstate.txkeyid,
+					 cb->wepstate.exclude_unencr);
+#endif
+
+  out:    
     break;
 
     // Get the WEP keys and mode
   case SIOCGIWENCODE:
     if (cb->dbg_mask & DBG_DEV_CALLS)
       printk(KERN_DEBUG "%s: ioctl SIOCGIWENCODE\n", cb->name);
-    rc = -EOPNOTSUPP;
+
+    if (cb->cardmode != 'H')
+      rc = -EOPNOTSUPP;
+    else
+      {
+        index = (wrq->u.encoding.flags & IW_ENCODE_INDEX) - 1;
+        if ((index < 0) || (index >= WEP_CNT))
+          index = cb->wepstate.txkeyid;
+
+        wrq->u.encoding.flags = (cb->wepstate.exclude_unencr) ? IW_ENCODE_RESTRICTED : IW_ENCODE_OPEN;
+        if (!cb->wepstate.encrypt)
+          wrq->u.encoding.flags |= IW_ENCODE_DISABLED;
+        if (wrq->u.encoding.pointer)
+          {
+            if (copy_to_user(wrq->u.encoding.pointer, cb->wepstate.wepkeys[index].value, WEP_MAXLEN))
+              rc = -EFAULT;
+            wrq->u.encoding.flags |= (index + 1);
+            wrq->u.encoding.length = cb->wepstate.wepkeys[index].length;
+          }
+        rc = 0;
+      }
     break;
 
     // Get the current Tx-Power
@@ -3002,11 +3121,11 @@ int wl24n_ioctl(struct net_device *dev, struct ifreq *rq, int cmd)
       /* get the tx power of level x in mW */
       rc = hw_getmib(cb, aTxPowerLevel1+cb->last_mibcfm.MibValue[0]-1);
       if (rc == 0) {
-	wrq->u.txpower.value = cb->last_mibcfm.MibValue[0];
-	wrq->u.txpower.fixed = 0;	/* power control possible ??? */
-	wrq->u.txpower.disabled = 0;	/* Can't turn off */
-	/* which units has the result ? */
-	wrq->u.txpower.flags = IW_TXPOW_MWATT;
+        wrq->u.txpower.value = cb->last_mibcfm.MibValue[0];
+        wrq->u.txpower.fixed = 0;	/* power control possible ??? */
+        wrq->u.txpower.disabled = 0;	/* Can't turn off */
+        /* which units has the result ? */
+        wrq->u.txpower.flags = IW_TXPOW_MWATT;
       }
     }
     break;
@@ -3016,10 +3135,10 @@ int wl24n_ioctl(struct net_device *dev, struct ifreq *rq, int cmd)
     {
       uint8 level = wrq->u.txpower.value;
       if (cb->dbg_mask & DBG_DEV_CALLS)
-	printk(KERN_DEBUG "%s: ioctl SIOCSIWTXPOW, value %d\n", 
-	       cb->name, wrq->u.txpower.value);
+        printk(KERN_DEBUG "%s: ioctl SIOCSIWTXPOW, value %d\n", 
+               cb->name, wrq->u.txpower.value);
       /* TODO: unit conversion (read the table mW -> tx level once
-	 from firmware and hardcode it here) */
+         from firmware and hardcode it here) */
       rc = hw_setmib(cb, aCurrentTxPowerLevel,&level, sizeof(level));
     }
     break;
@@ -3029,85 +3148,85 @@ int wl24n_ioctl(struct net_device *dev, struct ifreq *rq, int cmd)
     if (cb->dbg_mask & DBG_DEV_CALLS)
       printk(KERN_DEBUG "%s: ioctl SIOCGIWRANGE\n", cb->name);
     if (wrq->u.data.pointer) {
-	struct iw_range range;
-	rc = verify_area(VERIFY_WRITE, wrq->u.data.pointer, 
-                         sizeof(struct iw_range));
-	if (rc)
-	  break;
-				/* Set the length (very important for
-				 * backward compatibility) */
-	wrq->u.data.length = sizeof(range);
+      struct iw_range range;
+      rc = verify_area(VERIFY_WRITE, wrq->u.data.pointer, 
+                       sizeof(struct iw_range));
+      if (rc)
+        break;
+      /* Set the length (very important for
+       * backward compatibility) */
+      wrq->u.data.length = sizeof(range);
 
-				/* Set all the info we don't care or
-				 * don't know about to zero */
-	memset(&range, 0, sizeof(range));
+      /* Set all the info we don't care or
+       * don't know about to zero */
+      memset(&range, 0, sizeof(range));
 
 #if WIRELESS_EXT > 10  /* Set the Wireless Extension versions */
-	range.we_version_compiled = WIRELESS_EXT;
-	range.we_version_source = 10;
+      range.we_version_compiled = WIRELESS_EXT;
+      range.we_version_source = 10;
 #endif /* WIRELESS_EXT > 10 */
 
-        // Throughput is no way near 2 Mb/s !
-        // This value should be :
-        //	1.6 Mb/s for the 2 Mb/s card
-        //	~5 Mb/s for the 11 Mb/s card
-        // Jean II
-	range.throughput = 1.6 * 1024 * 1024;
-	range.min_nwid = 0x0000;
-	range.max_nwid = 0x0000;
-	range.num_channels = 14;
+      // Throughput is no way near 2 Mb/s !
+      // This value should be :
+      //	1.6 Mb/s for the 2 Mb/s card
+      //	~5 Mb/s for the 11 Mb/s card
+      // Jean II
+      range.throughput = 1.6 * 1024 * 1024;
+      range.min_nwid = 0x0000;
+      range.max_nwid = 0x0000;
+      range.num_channels = 14;
         
-        /* set range.freq[] and range.num_frequency */
-        {
-          int k = 0, i;
-          for(i=0; i < IW_MAX_FREQUENCIES; i++) {
-            if (cb->frdesc->channel_map & (1<<i)) {
-              range.freq[k].i = i+1;	/* Set the list index */
-              range.freq[k].m = frequency_list[i] * 100000;
-              range.freq[k++].e = 1; /* frequency_list is in MHz ->
-				      * 10^5 * 10 */
-            }
+      /* set range.freq[] and range.num_frequency */
+      {
+        int k = 0, i;
+        for(i=0; i < IW_MAX_FREQUENCIES; i++) {
+          if (cb->frdesc->channel_map & (1<<i)) {
+            range.freq[k].i = i+1;	/* Set the list index */
+            range.freq[k].m = frequency_list[i] * 100000;
+            range.freq[k++].e = 1; /* frequency_list is in MHz ->
+                                    * 10^5 * 10 */
           }
-          range.num_frequency = k;
         }
+        range.num_frequency = k;
+      }
 
-	range.sensitivity = 0;
+      range.sensitivity = 0;
 
-        range.max_qual.qual = 0;
-        range.max_qual.level = 63;
-        range.max_qual.noise = 0;
+      range.max_qual.qual = 0;
+      range.max_qual.level = 63;
+      range.max_qual.noise = 0;
 
-	range.num_bitrates = 2;
-        range.bitrate[0] = 1000000;
-        range.bitrate[1] = 2000000;
+      range.num_bitrates = 2;
+      range.bitrate[0] = 1000000;
+      range.bitrate[1] = 2000000;
 
-	range.min_rts = 0;
-	range.max_rts = 2347;
-	range.min_frag = 256;
-	range.max_frag = 2346;
+      range.min_rts = 0;
+      range.max_rts = 2347;
+      range.min_frag = 256;
+      range.max_frag = 2346;
 
-				// WEP is not supported.
-        range.num_encoding_sizes = 0;
-        range.max_encoding_tokens = 0;
+      // WEP is not supported.
+      range.num_encoding_sizes = 0;
+      range.max_encoding_tokens = 0;
 
 #if WIRELESS_EXT > 9
-				/* Power Management */
-	range.min_pmp = 0;		/* ??? */
-	range.max_pmp = 65535000;	/* ??? */
-	range.pmp_flags = 0;
-	range.pmt_flags = 0;
-	range.pm_capa = 0;
+      /* Power Management */
+      range.min_pmp = 0;		/* ??? */
+      range.max_pmp = 65535000;	/* ??? */
+      range.pmp_flags = 0;
+      range.pmt_flags = 0;
+      range.pm_capa = 0;
 
-				/* Transmit Power */
-	range.txpower[0] = 17; /* ??? maybe more levels ??? */
-	range.num_txpower = 1;
-	range.txpower_capa = IW_TXPOW_DBM;
+      /* Transmit Power */
+      range.txpower[0] = 17; /* ??? maybe more levels ??? */
+      range.num_txpower = 1;
+      range.txpower_capa = IW_TXPOW_DBM;
 #endif /* WIRELESS_EXT > 9 */
 
-	if (copy_to_user(wrq->u.data.pointer, &range,
-                         sizeof(struct iw_range)))
-	  rc = -EFAULT;
-      }
+      if (copy_to_user(wrq->u.data.pointer, &range,
+                       sizeof(struct iw_range)))
+        rc = -EFAULT;
+    }
     break;
 
 #if IW_MAX_SPY > 0
@@ -3128,18 +3247,18 @@ int wl24n_ioctl(struct net_device *dev, struct ifreq *rq, int cmd)
   case SIOCGIWPRIV:
     if (wrq->u.data.pointer)
       {
-	struct iw_priv_args priv[] = {
-	  { PRIV_IOCTL_RESET, IW_PRIV_TYPE_INT | IW_PRIV_SIZE_FIXED | 1,
+        struct iw_priv_args priv[] = {
+          { PRIV_IOCTL_RESET, IW_PRIV_TYPE_INT | IW_PRIV_SIZE_FIXED | 1,
             0, "reset" }, /* param: int (0 for soft reset / 1 for hard) */
 
           { PRIV_IOCTL_MIBSET, IW_PRIV_TYPE_BYTE | (MAX_MIB_VALUE_SZ+1), 
             IW_PRIV_TYPE_INT | 1, "mibset"},
-	  /* param: first byte is the attribute code, rest is value,
-	     result: the status */
+          /* param: first byte is the attribute code, rest is value,
+             result: the status */
 
           { PRIV_IOCTL_MIBGET, IW_PRIV_TYPE_BYTE | 1 
-	    /* not fixed otherwise we don't get a user space buffer 
-	       for the return values (see iwpriv.c) */,
+            /* not fixed otherwise we don't get a user space buffer 
+               for the return values (see iwpriv.c) */,
             IW_PRIV_TYPE_BYTE | MAX_MIB_VALUE_SZ, "mibget"},
           /* param: MIB attribute
              result: MIB value */
@@ -3162,17 +3281,17 @@ int wl24n_ioctl(struct net_device *dev, struct ifreq *rq, int cmd)
           /* results: copy of cb->BSSset[] */
 
           { PRIV_IOCTL_GET_LLC,
-	    0, IW_PRIV_TYPE_INT | IW_PRIV_SIZE_FIXED | 1, "get_llc"},
+            0, IW_PRIV_TYPE_INT | IW_PRIV_SIZE_FIXED | 1, "get_llc"},
           /* result: current LLC type */
 
           { PRIV_IOCTL_SET_LLC,
             IW_PRIV_TYPE_INT | IW_PRIV_SIZE_FIXED | 1, 0, "set_llc"},
           /* param: new LLC type */
-	};
+        };
 
-	wrq->u.data.length = sizeof(priv) / sizeof(priv[0]);
-	if (copy_to_user(wrq->u.data.pointer, priv, sizeof(priv)))
-	  rc = -EFAULT;
+        wrq->u.data.length = sizeof(priv) / sizeof(priv[0]);
+        if (copy_to_user(wrq->u.data.pointer, priv, sizeof(priv)))
+          rc = -EFAULT;
       }
     break;
 
@@ -3185,39 +3304,39 @@ int wl24n_ioctl(struct net_device *dev, struct ifreq *rq, int cmd)
 
       if (*((int *) wrq->u.name) > 0) {
 
-	/* 'hard' reset (but all params [e.g. bsstype] remain) */
-	if (!restart_card(cb))
-	  printk(KERN_WARNING "%s: reset_card failed\n", cb->name);
-	else {
-	  printk(KERN_DEBUG "%s: Forced hard reset\n", cb->name);
-	}
+        /* 'hard' reset (but all params [e.g. bsstype] remain) */
+        if (!restart_card(cb))
+          printk(KERN_WARNING "%s: reset_card failed\n", cb->name);
+        else {
+          printk(KERN_DEBUG "%s: Forced hard reset\n", cb->name);
+        }
 
       } else {
 
 #if 1
-	rc = -EOPNOTSUPP;
+        rc = -EOPNOTSUPP;
 #else
-	// 'soft' reset
-	if (!ResetReq(cb,FALSE,cb->MacAddress))
-	  printk(KERN_WARNING "%s: sending ResetReq failed\n",cb->name);
-	else {
-	  printk(KERN_DEBUG "%s: Forced soft reset\n", cb->name);
-	  init_scanlist(cb); /* init. cb-> vars for initial scan */
-	  /* try to find all infrastructure BSS and IBSS for a 
-	     properly filled
-	     BSSset[] table. We match the correct BSS type later. */
-	  newstate(cb,state_scanning);
+        // 'soft' reset
+        if (!ResetReq(cb,FALSE,cb->MacAddress))
+          printk(KERN_WARNING "%s: sending ResetReq failed\n",cb->name);
+        else {
+          printk(KERN_DEBUG "%s: Forced soft reset\n", cb->name);
+          init_scanlist(cb); /* init. cb-> vars for initial scan */
+          /* try to find all infrastructure BSS and IBSS for a 
+             properly filled
+             BSSset[] table. We match the correct BSS type later. */
+          newstate(cb,state_scanning);
 
-	  /* reset statistics */
-	  memset(&cb->stats,0,sizeof(cb->stats));
+          /* reset statistics */
+          memset(&cb->stats,0,sizeof(cb->stats));
 # ifdef WIRELESS_EXT
-	  memset(&cb->wstats,0,sizeof(cb->wstats));
+          memset(&cb->wstats,0,sizeof(cb->wstats));
 # endif
 
-	  ScanReq(cb, SCAN_MIN_CHANNEL_TIME,
-		  SCAN_FIRST_RUN_MAX_CHANNEL_TIME,
-		  BSSType_AnyBSS, ScanType_Active);
-	}
+          ScanReq(cb, SCAN_MIN_CHANNEL_TIME,
+                  SCAN_FIRST_RUN_MAX_CHANNEL_TIME,
+                  BSSType_AnyBSS, ScanType_Active);
+        }
 #endif
       }
     }
@@ -3229,29 +3348,29 @@ int wl24n_ioctl(struct net_device *dev, struct ifreq *rq, int cmd)
       uint8 buf[1+MAX_MIB_VALUE_SZ];
 
       if (wrq->u.data.length == 0) {
-	rc = -EINVAL;
-	break;
+        rc = -EINVAL;
+        break;
       }
 
       if (copy_from_user(buf,wrq->u.data.pointer,wrq->u.data.length)) {
-	rc = -EFAULT;
-	printk(KERN_DEBUG "%s: ioctl PRIV_IOCTL_MIBSET failed to copy input from %p\n",
-	       cb->name, wrq->u.data.pointer);
-	break;
+        rc = -EFAULT;
+        printk(KERN_DEBUG "%s: ioctl PRIV_IOCTL_MIBSET failed to copy input from %p\n",
+               cb->name, wrq->u.data.pointer);
+        break;
       }
       rc = hw_setmib(cb, buf[0], buf+1, wrq->u.data.length-1);
       /* we ignore -EFAULT here, because hw_setmib has set this code only 
-	 if SetCfm_t.Status was not successful */
+         if SetCfm_t.Status was not successful */
       if (rc == -EFAULT)
-	rc = 0;
+        rc = 0;
       if (rc == 0) {
-	int status = le16_to_cpu(cb->last_mibcfm.MibStatus);
-	if (copy_to_user(wrq->u.data.pointer,&status, sizeof(status))) {
-	  printk(KERN_DEBUG "%s: ioctl PRIV_IOCTL_MIBSET failed to copy status to %p\n",
-		 cb->name, wrq->u.data.pointer);
-	  rc = -EFAULT;
-	} else
-	  wrq->u.data.length = 1;
+        int status = le16_to_cpu(cb->last_mibcfm.MibStatus);
+        if (copy_to_user(wrq->u.data.pointer,&status, sizeof(status))) {
+          printk(KERN_DEBUG "%s: ioctl PRIV_IOCTL_MIBSET failed to copy status to %p\n",
+                 cb->name, wrq->u.data.pointer);
+          rc = -EFAULT;
+        } else
+          wrq->u.data.length = 1;
       }
     }
     break;
@@ -3261,24 +3380,24 @@ int wl24n_ioctl(struct net_device *dev, struct ifreq *rq, int cmd)
     {
       uint8 attr;
       if (copy_from_user(&attr,wrq->u.data.pointer,sizeof(attr))) {
-	rc = -EFAULT;
-	printk(KERN_DEBUG "%s: ioctl PRIV_IOCTL_MIBGET failed to copy input from %p\n",
-	       cb->name, wrq->u.data.pointer);
-	break;
+        rc = -EFAULT;
+        printk(KERN_DEBUG "%s: ioctl PRIV_IOCTL_MIBGET failed to copy input from %p\n",
+               cb->name, wrq->u.data.pointer);
+        break;
       }
       rc = hw_getmib(cb, attr);
       if (rc == 0) {
 #if 0
-	printk(KERN_DEBUG "%s: PRIV_IOCTL_MIBGET data: pointer %p length %d\n",
-	       cb->name, wrq->u.data.pointer, wrq->u.data.length);
+        printk(KERN_DEBUG "%s: PRIV_IOCTL_MIBGET data: pointer %p length %d\n",
+               cb->name, wrq->u.data.pointer, wrq->u.data.length);
 #endif
-	if (copy_to_user(wrq->u.data.pointer,cb->last_mibcfm.MibValue,
-			 MAX_MIB_VALUE_SZ)) {
-	  printk(KERN_DEBUG "%s: ioctl PRIV_IOCTL_MIBGET failed to copy result to %p\n",
-		 cb->name, wrq->u.data.pointer);
-	  rc = -EFAULT;
-	} else
-	  wrq->u.data.length = MAX_MIB_VALUE_SZ;
+        if (copy_to_user(wrq->u.data.pointer,cb->last_mibcfm.MibValue,
+                         MAX_MIB_VALUE_SZ)) {
+          printk(KERN_DEBUG "%s: ioctl PRIV_IOCTL_MIBGET failed to copy result to %p\n",
+                 cb->name, wrq->u.data.pointer);
+          rc = -EFAULT;
+        } else
+          wrq->u.data.length = MAX_MIB_VALUE_SZ;
       }
     }
     break;
@@ -3290,8 +3409,8 @@ int wl24n_ioctl(struct net_device *dev, struct ifreq *rq, int cmd)
 
       memcpy(wrq->u.name, m, sizeof(m));
       if (cb->dbg_mask & DBG_DEV_CALLS)
-	printk(KERN_DEBUG "%s: ioctl PRIV_IOCTL_GETDBG_MASK dbg masks: %08x %08x %08x\n",
-	       cb->name, m[0], m[1], m[2]);
+        printk(KERN_DEBUG "%s: ioctl PRIV_IOCTL_GETDBG_MASK dbg masks: %08x %08x %08x\n",
+               cb->name, m[0], m[1], m[2]);
     }
     break;
 
@@ -3300,7 +3419,7 @@ int wl24n_ioctl(struct net_device *dev, struct ifreq *rq, int cmd)
       rc = -EPERM;
     } else {
       uint32 oldm[3] = {cb->dbg_mask, cb->msg_from_dbg_mask,
-			cb->msg_to_dbg_mask};
+                        cb->msg_to_dbg_mask};
       uint32 m[3];
         
       /* where are the input values passed: in u.name or in u.data ??? */
@@ -3310,15 +3429,15 @@ int wl24n_ioctl(struct net_device *dev, struct ifreq *rq, int cmd)
       cb->msg_to_dbg_mask = m[2];
       
       if (cb->dbg_mask & DBG_DEV_CALLS)
-	printk(KERN_DEBUG "%s: ioctl PRIV_IOCTL_SETDBG_MASK new dbg masks: %08x %08x %08x\n",
-	       cb->name, cb->dbg_mask, cb->msg_from_dbg_mask,
-	       cb->msg_to_dbg_mask);
+        printk(KERN_DEBUG "%s: ioctl PRIV_IOCTL_SETDBG_MASK new dbg masks: %08x %08x %08x\n",
+               cb->name, cb->dbg_mask, cb->msg_from_dbg_mask,
+               cb->msg_to_dbg_mask);
         
       if (copy_to_user(wrq->u.data.pointer, oldm,
-		       sizeof(oldm)))
-	rc = -EFAULT;
+                       sizeof(oldm)))
+        rc = -EFAULT;
       else
-	wrq->u.data.length = 3;
+        wrq->u.data.length = 3;
     }
     break;
 
@@ -3331,7 +3450,7 @@ int wl24n_ioctl(struct net_device *dev, struct ifreq *rq, int cmd)
       cb->dbg_mask |= DBG_MSG_FROM_CARD;
       cb->msg_from_dbg_mask |= DBG_SITE_CFM;
       if (!SiteReq(cb))
-	printk(KERN_WARNING "%s: sending SiteReq failed\n",cb->name);
+        printk(KERN_WARNING "%s: sending SiteReq failed\n",cb->name);
     }
     break;
         
@@ -3354,14 +3473,14 @@ int wl24n_ioctl(struct net_device *dev, struct ifreq *rq, int cmd)
     } else {
       int t = *((int *)wrq->u.name);
       if (t != LLCType_WaveLan && t != LLCType_IEEE_802_11)
-	rc = -EINVAL;
+        rc = -EINVAL;
       else {
-	cb->llctype = t;
-	if (cb->dbg_mask & DBG_DEV_CALLS)
-	  printk(KERN_DEBUG "%s: new LLCType set: %d\n",
-		 cb->name, cb->llctype);
-	// we don't need commit, as this option just defines how to format tx/rx packets 
-	//need_commit = 1; 
+        cb->llctype = t;
+        if (cb->dbg_mask & DBG_DEV_CALLS)
+          printk(KERN_DEBUG "%s: new LLCType set: %d\n",
+                 cb->name, cb->llctype);
+        // we don't need commit, as this option just defines how to format tx/rx packets 
+        //need_commit = 1; 
       }
     }
     break;
@@ -3375,8 +3494,8 @@ int wl24n_ioctl(struct net_device *dev, struct ifreq *rq, int cmd)
     rc = -EOPNOTSUPP;
   } /* switch (cmd) */
 
-    if ((cb->dbg_mask & DBG_DEV_CALLS) && rc < 0)
-      printk(KERN_DEBUG "%s: ioctl(x%x) failed with %d\n", cb->name, cmd, rc);
+  if ((cb->dbg_mask & DBG_DEV_CALLS) && rc < 0)
+    printk(KERN_DEBUG "%s: ioctl(x%x) failed with %d\n", cb->name, cmd, rc);
 
   if (need_commit) {
     if (!restart_card(cb))
@@ -3390,7 +3509,7 @@ int wl24n_ioctl(struct net_device *dev, struct ifreq *rq, int cmd)
 #define BEACON_PERIOD 400 /* time between beacon frames in usec */
 #define DTIM_PERIOD 1 /* beacon intervals between beacon frames with DTIM */
 #define PROBE_DELAY 0x10 /* active scan & join: min. time to wait before 
-                         Probe frame is sent */
+                            Probe frame is sent */
 
 /* bits in the CapabilityInfo field below (see 7.3.14 in [1]) */
 #define CAP_ESS  0x0001 
@@ -3442,7 +3561,7 @@ bool StartReq(WL24Cb_t *cb, uint8 channel, BSSType_t bsstype)
   Req.DTIMPeriod = cpu_to_le16(DTIM_PERIOD);
 
   Req.ProbeDelay = cpu_to_le16(0); /* we start a beacon here,
-                                                not an active scan ??? */
+                                      not an active scan ??? */
 
   Req.PHYpset[0] = IE_ID_DS_PARAM_SET;
   Req.PHYpset[1] = 1;
@@ -3500,8 +3619,8 @@ typedef struct {
    scan for BSS (see 10.3.2.1 in [1])
    min/max_channel_time: min/max time in TUs to spend on one channel */
 bool  ScanReq(WL24Cb_t *cb, uint16 min_channel_time,
-             uint16 max_channel_time, BSSType_t bsstype,
-             ScanType_t scantype)
+              uint16 max_channel_time, BSSType_t bsstype,
+              ScanType_t scantype)
 {
   ScanReq_t Req;
 
@@ -3517,13 +3636,14 @@ bool  ScanReq(WL24Cb_t *cb, uint16 min_channel_time,
        (to get most BSS into the list) and all other scans with the
        configured SSID, because a "closed network"
        won't answer to a probe with empty SSID */
-    /* To set the SSID in ScanRequest requires firmware >= 2.10 ! */
+    /* firmwares < 2.10 always use the ANY SSID even if we specify 
+       another here (a bug) */
     Req.SSID[0] = IE_ID_SSID;
     Req.SSID[1] = 0;
   } else {
     memcpy(Req.SSID, cb->ESSID, 1+1+cb->ESSID[1]);
   }
-
+ 
   Req.ScanType = scantype;
   Req.ProbeDelay = cpu_to_le16(PROBE_DELAY);
   Req.MinChannelTime = cpu_to_le16(min_channel_time);
@@ -3537,9 +3657,12 @@ bool  ScanReq(WL24Cb_t *cb, uint16 min_channel_time,
 
   if ((cb->dbg_mask & DBG_MSG_TO_CARD) &&
       (cb->msg_to_dbg_mask & DBG_SCAN_REQ)) {
-    printk(KERN_DEBUG "%s: ScanReq ScanType %d BSSType %d "
-           "min/max channel time %d/%d\n",
-           cb->name, Req.ScanType, Req.BSSType,
+    printk(KERN_DEBUG "%s: ScanReq ScanType %d BSSType %d SSID (%d)%s (",
+           cb->name, Req.ScanType, Req.BSSType, Req.SSID[1], 
+					 Req.SSID[1] ? cb->ESSID+2 /*Req.SSID+2 is not \0 term.!*/ : 
+           (uint8 *)"");
+		dumpk(Req.SSID+2, Req.SSID[1]);
+		printk(") min/max channel time %d/%d\n",
            min_channel_time, max_channel_time);
   }
 
@@ -3566,7 +3689,7 @@ typedef struct {
   uint16  CapabilityInfo;
   uint8 BSSType;
   uint8  BSSID[6];
-  uint8 SSID[34];
+  uint8 SSID[1+1+32];
   uint8 PHYpset[3];
   uint8 CFpset[8];
   uint8 IBSSpset[4];
@@ -3597,7 +3720,15 @@ bool JoinReq(WL24Cb_t *cb, uint16 station)
   /* copy the BSSDescription elements from the BSS set 
      (see 10.3.2.2.2 and 10.3.3.1.2 in [1]) */
   memcpy(Req.BSSID,cb->BSSset[station].BSSID,sizeof(Req.BSSID));
-  memcpy(Req.SSID,cb->BSSset[station].SSID,sizeof(Req.SSID));
+
+	if (memcmp(&cb->BSSset[station].SSID[2], zeros, 
+						 cb->BSSset[station].SSID[1]))
+		/* just copy the BSS's SSID if it is not filled with \0 */
+		memcpy(Req.SSID,cb->BSSset[station].SSID,sizeof(Req.SSID));
+	else
+		/* otherwise take the SSID specified by iwconfig / module parameter */
+		memcpy(Req.SSID,cb->ESSID,sizeof(Req.SSID));
+
   Req.BSSType = cb->BSSset[station].BSSType;
   Req.BeaconPeriod = cpu_to_le16(cb->BSSset[station].BeaconPeriod);
   Req.DTIMPeriod = cpu_to_le16(cb->BSSset[station].DTIMPeriod);
@@ -3616,11 +3747,23 @@ bool JoinReq(WL24Cb_t *cb, uint16 station)
   if ((cb->dbg_mask & DBG_MSG_TO_CARD) &&
       (cb->msg_to_dbg_mask & DBG_JOIN_REQ)) {
     printk(KERN_DEBUG "%s: JoinReq ch %d cap x%04x "
-	   "BSSID %02x:%02x:%02x:%02x:%02x:%02x SSID %s\n",
-	   cb->name, Req.PHYpset[2],Req.CapabilityInfo,
-	   Req.BSSID[0],Req.BSSID[1],Req.BSSID[2],
-	   Req.BSSID[3],Req.BSSID[4],Req.BSSID[5],
-           cb->BSSset[station].SSID);
+           "BSSID %02x:%02x:%02x:%02x:%02x:%02x broadcasted SSID (%d)%s (",
+           cb->name, Req.PHYpset[2],Req.CapabilityInfo,
+           Req.BSSID[0],Req.BSSID[1],Req.BSSID[2],
+           Req.BSSID[3],Req.BSSID[4],Req.BSSID[5],
+           cb->BSSset[station].SSID[1], &cb->BSSset[station].SSID[2]);
+		dumpk(cb->BSSset[station].SSID+2, cb->BSSset[station].SSID[1]);
+		{
+			/* make Req.SSID[2] \0 terminated */
+			char buf[IW_ESSID_MAX_SIZE+1];
+			assert(Req.SSID[1] <= IW_ESSID_MAX_SIZE);
+			memcpy(buf, &Req.SSID[2], Req.SSID[1]);
+			buf[Req.SSID[1]] = '\0';
+      printk(") joined SSID (%d)%s (",
+             Req.SSID[1], buf);
+		}
+		dumpk(Req.SSID+2,Req.SSID[1]);
+		printk(")\n");
   }
 
   /* send the request */
@@ -3660,10 +3803,10 @@ bool AuthReq(WL24Cb_t *cb, uint16 auth_type, uint16 auth_timeout,
   if ((cb->dbg_mask & DBG_MSG_TO_CARD) &&
       (cb->msg_to_dbg_mask & DBG_AUTH_REQ)) {
     printk("%s: AuthReq  type %d "
-	 "BSSID: %02x:%02x:%02x:%02x:%02x:%02x\n",
-	 cb->name, Req.Type,
-	 Req.MacAddress[0],Req.MacAddress[1],Req.MacAddress[2],
-	 Req.MacAddress[3],Req.MacAddress[4],Req.MacAddress[5]);
+           "BSSID: %02x:%02x:%02x:%02x:%02x:%02x\n",
+           cb->name, Req.Type,
+           Req.MacAddress[0],Req.MacAddress[1],Req.MacAddress[2],
+           Req.MacAddress[3],Req.MacAddress[4],Req.MacAddress[5]);
   }
 
   /* send the request */
@@ -3778,7 +3921,7 @@ typedef struct {
   - wakeup: if TRUE awake the MAC immediately
   - receive_dtims: if TRUE the STA awakes to receive all DTIMs */
 bool PowerMgtReq(WL24Cb_t *cb, bool power_save, bool wakeup,
-                  bool receive_dtims)
+                 bool receive_dtims)
 {
   PowerMgtReq_t Req;
 
@@ -3879,7 +4022,7 @@ bool GetMIBReq(WL24Cb_t *cb, uint16 attrib)
 
   if ((cb->dbg_mask & DBG_MSG_TO_CARD) &&
       (cb->msg_to_dbg_mask & DBG_GETMIB_REQ))
-    printk("%s: GetMIBReq attr %d\n",
+    printk(KERN_DEBUG "%s: GetMIBReq attr %d\n",
            cb->name, le16_to_cpu(Req.MibAtrib));
 
   /* send the request */
@@ -3982,7 +4125,7 @@ Card_Word_t cfm_avail(WL24Cb_t *cb)
 
 #ifdef LOG_CFM_AVAIL
   printk(KERN_DEBUG "%s: %s: ESBQCfm %x: owner %x buf %x\n",
-	 cb->name, __FUNCTION__, cb->ESBQCfm,  cfm.owner, cfm.buf);
+         cb->name, __FUNCTION__, cb->ESBQCfm,  cfm.owner, cfm.buf);
 #endif
 
   return ret;
@@ -4005,17 +4148,17 @@ void cfm_done(WL24Cb_t *cb)
 
     /* I saw this error once, but couldn't reproduce it... */
     printk(KERN_WARNING "%s: %s owner bit unset in ESBQCfm @"
-	   "x%04x: owner x%x buf x%x\n",
-	   cb->name, __FUNCTION__, cb->ESBQCfm, cfm.owner, cfm.buf);
+           "x%04x: owner x%x buf x%x\n",
+           cb->name, __FUNCTION__, cb->ESBQCfm, cfm.owner, cfm.buf);
 
     copy_words_from_card((uint16 *)&cfm, cb->ESBQCfm, SZ_ESBQ_W, cb);
     printk(KERN_WARNING "%s: %s re-read ESBQCfm @ x%04x: owner x%x buf x%x\n",
-	   cb->name, __FUNCTION__, cb->ESBQCfm, cfm.owner, cfm.buf);
+           cb->name, __FUNCTION__, cb->ESBQCfm, cfm.owner, cfm.buf);
   }
 
   if (cfm.owner & ESBQ_OWNED_BY_DRV) {
     cfm.owner &= 0xff; /* old sw does delete the whole byte, not only
-			  the set bit ??? */
+                          the set bit ??? */
     copy_words_to_card(cb->ESBQCfm, (uint16 *)&cfm, SZ_ESBQ_W, cb);
   }
 
@@ -4026,7 +4169,7 @@ void cfm_done(WL24Cb_t *cb)
 
 #ifdef LOG_CFM_DONE
   printk(KERN_DEBUG "%s: %s: next ESBQCfm %x (ESBQCfmStart %x)\n",
-	 cb->name, __FUNCTION__, cb->ESBQCfm, cb->ESBQCfmStart);
+         cb->name, __FUNCTION__, cb->ESBQCfm, cb->ESBQCfmStart);
 #endif
 
 } /* end of cfm_done */
@@ -4059,7 +4202,7 @@ typedef struct {
 
 /* MdInd starts with a RxHeader_t */       
 typedef struct {
-  RxFrameLinkHeader_t flh;
+  RxFrameLinkHeader_t flh; /* 5 byte */
   uint8   RxNextFrame;
   uint8   RxNextFrame1;
   uint8   RSSI;
@@ -4269,562 +4412,567 @@ void debug_msg_from_card(WL24Cb_t *cb, uint8 sigid, Card_Word_t msgbuf)
 
   switch (sigid) {
 
-      case Alarm_ID:
-        if (cb->msg_from_dbg_mask & DBG_ALARM)
-          printk(KERN_DEBUG "%s: Alarm from card\n",cb->name);
+  case Alarm_ID:
+    if (cb->msg_from_dbg_mask & DBG_ALARM)
+      printk(KERN_DEBUG "%s: Alarm from card\n",cb->name);
 #if TRACE_NR_RECS > 0
-        if (cb->trace_mask & (1 << TRACE_MSG_RCV)) {
-          uint8 buf[2];
-          buf[0] = sigid;
-          buf[1] = state2id(cb->state);
-          trace_add(cb, TRACE_MSG_RCV, buf, 2);
-        }
+    if (cb->trace_mask & (1 << TRACE_MSG_RCV)) {
+      uint8 buf[2];
+      buf[0] = sigid;
+      buf[1] = state2id(cb->state);
+      trace_add(cb, TRACE_MSG_RCV, buf, 2);
+    }
 #endif
-        break;
+    break;
 
-      case MdConfirm_ID:
-        if ((cb->msg_from_dbg_mask & DBG_MDCFM) ||
-	    (cb->msg_from_dbg_mask & DBG_FAILED_MDCFM) ||
-            (cb->trace_mask & (1 << TRACE_MSG_RCV))) {
-          MdCfm_t cfm;
-          copy_from_card(&cfm, msgbuf, sizeof(cfm), COPY_FAST, cb);
-          assert(cfm.SignalID == MdConfirm_ID);
-          if ((cb->msg_from_dbg_mask & DBG_MDCFM) || 
-	      ((cb->msg_from_dbg_mask & DBG_FAILED_MDCFM) && 
-	       (cfm.Status != Status_Success)))
-            printk(KERN_DEBUG "%s: MdCfm status %d prio %d serviceclass %d\n",
-                   cb->name, cfm.Status, cfm.Priority, cfm.ServiceClass);
+  case MdConfirm_ID:
+    if ((cb->msg_from_dbg_mask & DBG_MDCFM) ||
+        (cb->msg_from_dbg_mask & DBG_FAILED_MDCFM) ||
+        (cb->trace_mask & (1 << TRACE_MSG_RCV))) {
+      MdCfm_t cfm;
+      copy_from_card(&cfm, msgbuf, sizeof(cfm), COPY_FAST, cb);
+      assert(cfm.SignalID == MdConfirm_ID);
+      if ((cb->msg_from_dbg_mask & DBG_MDCFM) || 
+          ((cb->msg_from_dbg_mask & DBG_FAILED_MDCFM) && 
+           (cfm.Status != Status_Success)))
+        printk(KERN_DEBUG "%s: MdCfm status %d prio %d serviceclass %d\n",
+               cb->name, cfm.Status, cfm.Priority, cfm.ServiceClass);
 #if TRACE_NR_RECS > 0
-          if (cb->trace_mask & (1 << TRACE_MSG_RCV))
-            trace_add(cb, TRACE_MSG_RCV, &cfm.SignalID, 7);
+      if (cb->trace_mask & (1 << TRACE_MSG_RCV))
+        trace_add(cb, TRACE_MSG_RCV, &cfm.SignalID, 7);
 #endif
-        }
-        break;
+    }
+    break;
 
-      case MdIndicate_ID:
-        if ((cb->msg_from_dbg_mask & DBG_MDIND) ||
-            (cb->trace_mask & (1 << TRACE_MSG_RCV))) {
-          MdInd_t ind;
-          RxHeader_t rxhead;
+  case MdIndicate_ID:
+    if ((cb->msg_from_dbg_mask & DBG_MDIND) ||
+        (cb->trace_mask & (1 << TRACE_MSG_RCV))) {
+      MdInd_t ind;
+      RxHeader_t rxhead;
 
-          copy_from_card(&ind, msgbuf, sizeof(ind), COPY_FAST, cb);
-          assert(ind.SignalID == MdIndicate_ID);
+      copy_from_card(&ind, msgbuf, sizeof(ind), COPY_FAST, cb);
+      assert(ind.SignalID == MdIndicate_ID);
 
-          /* read rx header */
-          copy_from_card(&rxhead, ind.Data, sizeof(rxhead), COPY_FAST, cb);
+      /* read rx header */
+      copy_from_card(&rxhead, ind.Data, sizeof(rxhead), COPY_FAST, cb);
 
-          if (cb->msg_from_dbg_mask & DBG_MDIND)
-            printk(KERN_DEBUG "%s: MdInd reception %d prio %d serviceclass %d RSSI %d "
-                   " dest %02x:%02x:%02x:%02x:%02x:%02x "
-                   " src %02x:%02x:%02x:%02x:%02x:%02x\n",
-                   cb->name, ind.Reception, ind.Priority, ind.ServiceClass,
-                   rxhead.RSSI,
-                   ind.DAddr[0],ind.DAddr[1],ind.DAddr[2],ind.DAddr[3],
-                   ind.DAddr[4],ind.DAddr[5],
-                   ind.SAddr[0],ind.SAddr[1],ind.SAddr[2],ind.SAddr[3],
-                   ind.SAddr[4],ind.SAddr[5]);
+      if (cb->msg_from_dbg_mask & DBG_MDIND)
+        printk(KERN_DEBUG "%s: MdInd reception %d prio %d serviceclass %d RSSI %d "
+               " dest %02x:%02x:%02x:%02x:%02x:%02x "
+               " src %02x:%02x:%02x:%02x:%02x:%02x\n",
+               cb->name, ind.Reception, ind.Priority, ind.ServiceClass,
+               rxhead.RSSI,
+               ind.DAddr[0],ind.DAddr[1],ind.DAddr[2],ind.DAddr[3],
+               ind.DAddr[4],ind.DAddr[5],
+               ind.SAddr[0],ind.SAddr[1],ind.SAddr[2],ind.SAddr[3],
+               ind.SAddr[4],ind.SAddr[5]);
 
-          if (cb->msg_from_dbg_mask & DBG_MDIND_HEADER) {
+      if (cb->msg_from_dbg_mask & DBG_MDIND_HEADER) {
 
-            printk(KERN_DEBUG "%s: RxHd Service %x Length %x FrCtrl %x Duration %x\n",
-                   cb->name, rxhead.Service, le16_to_cpu(rxhead.Length),
-                   le16_to_cpu(rxhead.FrameControl),
-                   le16_to_cpu(rxhead.Duration));
+        printk(KERN_DEBUG "%s: RxHd Service %x Length %x FrCtrl %x Duration %x\n",
+               cb->name, rxhead.Service, le16_to_cpu(rxhead.Length),
+               le16_to_cpu(rxhead.FrameControl),
+               le16_to_cpu(rxhead.Duration));
 	  
-            printk(KERN_DEBUG "%s: RxHd Addr1 %02x:%02x:%02x:%02x:%02x:%02x "
-                   "Addr2 %02x:%02x:%02x:%02x:%02x:%02x\n",
-                   cb->name,
-                   rxhead.Address1[0],rxhead.Address1[1],rxhead.Address1[2],
-                   rxhead.Address1[3],rxhead.Address1[4],rxhead.Address1[5],
-                   rxhead.Address2[0],rxhead.Address2[1],rxhead.Address2[2],
-                   rxhead.Address2[3],rxhead.Address2[4],rxhead.Address2[5]);
+        printk(KERN_DEBUG "%s: RxHd Addr1 %02x:%02x:%02x:%02x:%02x:%02x "
+               "Addr2 %02x:%02x:%02x:%02x:%02x:%02x\n",
+               cb->name,
+               rxhead.Address1[0],rxhead.Address1[1],rxhead.Address1[2],
+               rxhead.Address1[3],rxhead.Address1[4],rxhead.Address1[5],
+               rxhead.Address2[0],rxhead.Address2[1],rxhead.Address2[2],
+               rxhead.Address2[3],rxhead.Address2[4],rxhead.Address2[5]);
 
-            printk(KERN_DEBUG "%s: RxHd Addr3 %02x:%02x:%02x:%02x:%02x:%02x "
-                   "Sequence %x\n",
-                   cb->name,
-                   rxhead.Address3[0],rxhead.Address3[1],rxhead.Address3[2],
-                   rxhead.Address3[3],rxhead.Address3[4],rxhead.Address3[5],
-                   le16_to_cpu(rxhead.Sequence));
-          }
+        printk(KERN_DEBUG "%s: RxHd Addr3 %02x:%02x:%02x:%02x:%02x:%02x "
+               "Sequence %x\n",
+               cb->name,
+               rxhead.Address3[0],rxhead.Address3[1],rxhead.Address3[2],
+               rxhead.Address3[3],rxhead.Address3[4],rxhead.Address3[5],
+               le16_to_cpu(rxhead.Sequence));
+      }
 
-          /* output first 32 bytes of data */
-          if (cb->msg_from_dbg_mask & DBG_MDIND_DATA) {
-            uint8 buf[32];
-            int i;
-            copy_from_card(buf, ind.Data+sizeof(RxHeader_t), sizeof(buf),
-                           COPY_FAST, cb);
-            printk(KERN_DEBUG "%s: MdInd Data ", cb->name);
-            for(i=0; i < sizeof(buf); i++) printk("%02x",buf[i]);
-            printk("\n");
-          }
-#if TRACE_NR_RECS > 0
-          if (cb->trace_mask & (1 << TRACE_MSG_RCV)) {
-            uint8 buf[1+6+6+2+1];
-            buf[0] = ind.SignalID;
-            memcpy(buf+1, ind.DAddr, 6);
-            memcpy(buf+7, ind.SAddr, 6);
-            memcpy(buf+13, &rxhead.Length, 2);
-            buf[15] = rxhead.RSSI;
-            trace_add(cb, TRACE_MSG_RCV, buf, sizeof(buf));
-          }
-#endif
-        } /* if (cb->msg_from_dbg_mask & DBG_MDIND) */
-        break;
-
-      case AssocConfirm_ID:
-        if ((cb->msg_from_dbg_mask & DBG_ASSOC_CFM) ||
-            (cb->trace_mask & (1 << TRACE_MSG_RCV))) {
-          AssocCfm_t cfm;
-          copy_from_card(&cfm, msgbuf, sizeof(cfm), COPY_FAST, cb);
-          assert(cfm.SignalID == AssocConfirm_ID);
-
-          if (cb->msg_from_dbg_mask & DBG_ASSOC_CFM)
-            printk(KERN_DEBUG "%s: AssocCfm status %d\n",
-                   cb->name, le16_to_cpu(cfm.Status));
-#if TRACE_NR_RECS > 0
-          if (cb->trace_mask & (1 << TRACE_MSG_RCV))
-            trace_add(cb, TRACE_MSG_RCV, &cfm.SignalID, 4);
-#endif
-        }
-        break;
-
-      case AssocIndicate_ID:
-        if ((cb->msg_from_dbg_mask & DBG_ASSOC_IND) ||
-            (cb->trace_mask & (1 << TRACE_MSG_RCV))) {
-          AssocInd_t ind;
-          copy_from_card(&ind, msgbuf, sizeof(ind), COPY_FAST, cb);
-          assert(ind.SignalID == AssocIndicate_ID);
-
-          if (cb->msg_from_dbg_mask & DBG_ASSOC_IND)
-            printk(KERN_DEBUG "%s: AssocIndicate %02x:%02x:%02x:%02x:%02x:%02x\n",
-                   cb->name,
-                   ind.MacAddress[0],ind.MacAddress[1],ind.MacAddress[2],
-                   ind.MacAddress[3],ind.MacAddress[4],ind.MacAddress[5]);
-#if TRACE_NR_RECS > 0
-          if (cb->trace_mask & (1 << TRACE_MSG_RCV))
-            trace_add(cb, TRACE_MSG_RCV, &ind.SignalID, 7);
-#endif
-        }
-        break;
-    
-      case AuthConfirm_ID:
-        if ((cb->msg_from_dbg_mask & DBG_AUTH_CFM) ||
-            (cb->trace_mask & (1 << TRACE_MSG_RCV))) {
-          AuthCfm_t cfm;
-
-          copy_from_card(&cfm, msgbuf, sizeof(cfm), COPY_FAST, cb);
-          assert(cfm.SignalID == AuthConfirm_ID);
-          if (cb->msg_from_dbg_mask & DBG_AUTH_CFM)
-            printk(KERN_DEBUG "%s: AuthCfm  type %d status %d "
-                   "MAC %02x:%02x:%02x:%02x:%02x:%02x\n",
-                   cb->name, le16_to_cpu(cfm.Type), le16_to_cpu(cfm.Status),
-                   cfm.MacAddress[0],cfm.MacAddress[1],cfm.MacAddress[2],
-                   cfm.MacAddress[3],cfm.MacAddress[4],cfm.MacAddress[5]);
-#if TRACE_NR_RECS > 0
-          if (cb->trace_mask & (1 << TRACE_MSG_RCV))
-            trace_add(cb, TRACE_MSG_RCV, &cfm.SignalID, 12);
-#endif
-        }
-        break;
-
-      case AuthIndicate_ID:
-        if ((cb->msg_from_dbg_mask & DBG_AUTH_IND) ||
-            (cb->trace_mask & (1 << TRACE_MSG_RCV))) {
-          AuthInd_t ind;
-
-          copy_from_card(&ind, msgbuf, sizeof(ind), COPY_FAST, cb);
-          assert(ind.SignalID == AuthIndicate_ID);
-          if (cb->msg_from_dbg_mask & DBG_AUTH_IND)
-            printk(KERN_DEBUG "%s: AuthInd  type %d "
-                   "MAC %02x:%02x:%02x:%02x:%02x:%02x\n",
-                   cb->name, le16_to_cpu(ind.Type),
-                   ind.MacAddress[0],ind.MacAddress[1],ind.MacAddress[2],
-                   ind.MacAddress[3],ind.MacAddress[4],ind.MacAddress[5]);
-#if TRACE_NR_RECS > 0
-          if (cb->trace_mask & (1 << TRACE_MSG_RCV))
-            trace_add(cb, TRACE_MSG_RCV, &ind.SignalID, 10);
-#endif
-        }
-        break;
-
-      case DeauthConfirm_ID:
-        if ((cb->msg_from_dbg_mask & DBG_DEAUTH_CFM) ||
-            (cb->trace_mask & (1 << TRACE_MSG_RCV))) {
-          DeauthCfm_t cfm;
-
-          copy_from_card(&cfm, msgbuf, sizeof(cfm), COPY_FAST, cb);
-          assert(cfm.SignalID == DeauthConfirm_ID);
-
-          if (cb->msg_from_dbg_mask & DBG_DEAUTH_CFM)
-            printk(KERN_DEBUG "%s: DeauthCfm  status %d "
-                   "MAC %02x:%02x:%02x:%02x:%02x:%02x\n",
-                   cb->name, le16_to_cpu(cfm.Status),
-                   cfm.MacAddress[0],cfm.MacAddress[1],cfm.MacAddress[2],
-                   cfm.MacAddress[3],cfm.MacAddress[4],cfm.MacAddress[5]);
-#if TRACE_NR_RECS > 0
-          if (cb->trace_mask & (1 << TRACE_MSG_RCV))
-            trace_add(cb, TRACE_MSG_RCV, &cfm.SignalID, 10);
-#endif
-        }
-        break;
-
-      case DeauthIndicate_ID:
-        if ((cb->msg_from_dbg_mask & DBG_DEAUTH_IND) ||
-            (cb->trace_mask & (1 << TRACE_MSG_RCV))) {
-          DeauthInd_t ind;
-
-          copy_from_card(&ind, msgbuf, sizeof(ind), COPY_FAST, cb);
-          assert(ind.SignalID == DeauthIndicate_ID);
-          if (cb->msg_from_dbg_mask & DBG_DEAUTH_IND)
-            printk(KERN_DEBUG "%s: DeauthInd reason %d "
-                   "MAC %02x:%02x:%02x:%02x:%02x:%02x\n",
-                   cb->name, le16_to_cpu(ind.Reason),
-                   ind.MacAddress[0],ind.MacAddress[1],ind.MacAddress[2],
-                   ind.MacAddress[3],ind.MacAddress[4],ind.MacAddress[5]);
-#if TRACE_NR_RECS > 0
-          if (cb->trace_mask & (1 << TRACE_MSG_RCV))
-            trace_add(cb, TRACE_MSG_RCV, &ind.SignalID, 10);
-#endif
-        }
-        break;
-
-      case DisassocConfirm_ID:
-        if ((cb->msg_from_dbg_mask & DBG_DISASSOC_CFM) || 
-            (cb->trace_mask & (1 << TRACE_MSG_RCV))) {
-          DisassocCfm_t cfm;
-
-          copy_from_card(&cfm, msgbuf, sizeof(cfm), COPY_FAST, cb);
-          assert(cfm.SignalID == DisassocConfirm_ID);
-          if (cb->msg_from_dbg_mask & DBG_DISASSOC_CFM)
-            printk(KERN_DEBUG "%s: DisassocCfm  status %d\n",
-                   cb->name, le16_to_cpu(cfm.Status));
-#if TRACE_NR_RECS > 0
-          if (cb->trace_mask & (1 << TRACE_MSG_RCV))
-            trace_add(cb, TRACE_MSG_RCV, &cfm.SignalID, 4);
-#endif
-        }
-        break;
-
-      case DisassocIndicate_ID:
-        if ((cb->msg_from_dbg_mask & DBG_DISASSOC_IND) || 
-            (cb->trace_mask & (1 << TRACE_MSG_RCV))) {
-          DisassocInd_t ind;
-
-          copy_from_card(&ind, msgbuf, sizeof(ind), COPY_FAST, cb);
-          assert(ind.SignalID == DisassocIndicate_ID);
-          if (cb->msg_from_dbg_mask & DBG_DISASSOC_IND)
-            printk(KERN_DEBUG "%s: DisassocInd reason %d "
-                   "MAC %02x:%02x:%02x:%02x:%02x:%02x\n",
-                   cb->name, le16_to_cpu(ind.Reason),
-                   ind.MacAddress[0],ind.MacAddress[1],ind.MacAddress[2],
-                   ind.MacAddress[3],ind.MacAddress[4],ind.MacAddress[5]);
-#if TRACE_NR_RECS > 0
-          if (cb->trace_mask & (1 << TRACE_MSG_RCV))
-            trace_add(cb, TRACE_MSG_RCV, &ind.SignalID, 10);
-#endif
-        }
-        break;
-
-      case GetConfirm_ID:
-        if ((cb->msg_from_dbg_mask & DBG_GET_CFM) || 
-            (cb->trace_mask & (1 << TRACE_MSG_RCV))) {
-          GetCfm_t cfm;
-
-          copy_from_card(&cfm, msgbuf, sizeof(cfm), COPY_FAST, cb);
-          assert(cfm.SignalID == GetConfirm_ID);
-
-          if (cb->msg_from_dbg_mask & DBG_GET_CFM) {
-            int i;
-            printk(KERN_DEBUG "%s: GetCfm  status %d attr %d val ",
-                   cb->name, le16_to_cpu(cfm.MibStatus),le16_to_cpu(cfm.MibAttrib));
-            for(i=0;i<32;i++) printk("%02x",cfm.MibValue[i]);
-            printk("\n");
-          }
-
-#if TRACE_NR_RECS > 0
-          if (cb->trace_mask & (1 << TRACE_MSG_RCV))
-            trace_add(cb, TRACE_MSG_RCV, &cfm.SignalID, 10);
-#endif
-        }
-        break;
-
-      case JoinConfirm_ID:
-        if ((cb->msg_from_dbg_mask & DBG_JOIN_CFM) || 
-            (cb->trace_mask & (1 << TRACE_MSG_RCV))){
-          JoinCfm_t cfm;
-          uint16 status;
-          BSSDesc_t *bss = &cb->BSSset[cb->currBSS];
-
-          copy_from_card(&cfm, msgbuf, sizeof(cfm), COPY_FAST, cb);
-          assert(cfm.SignalID == JoinConfirm_ID);
-          status = le16_to_cpu(cfm.Status);
-          if (cb->msg_from_dbg_mask & DBG_JOIN_CFM) {
-            if (status != Status_Success)
-              printk(KERN_DEBUG "%s: JoinCfm failed status %d\n", cb->name, status);
-            else {
-              printk("%s: Joining BSSID: %02x:%02x:%02x:%02x:%02x:%02x "
-                     "SSID len %d: %s chan %d cap x%04x rssi %d\n",
-                     cb->name,
-                     bss->BSSID[0],bss->BSSID[1],bss->BSSID[2],
-                     bss->BSSID[3],bss->BSSID[4],bss->BSSID[5],
-                     bss->SSID[1], bss->SSID+2, bss->PHYpset[2],
-                     bss->CapabilityInfo, bss->ScanRSSI);
-            }
-          }
-#if TRACE_NR_RECS > 0
-          if (cb->trace_mask & (1 << TRACE_MSG_RCV))
-            trace_add(cb, TRACE_MSG_RCV, &cfm.SignalID, 4);
-#endif
-        }
-        break;
-
-      case PowermgtConfirm_ID:
-        if ((cb->msg_from_dbg_mask & DBG_POWERMGT_CFM)  || 
-            (cb->trace_mask & (1 << TRACE_MSG_RCV))) {
-          PowerMgtCfm_t cfm;
-          copy_from_card(&cfm, msgbuf, sizeof(cfm), COPY_FAST, cb);
-          assert(cfm.SignalID == PowermgtConfirm_ID);
-
-          if (cb->msg_from_dbg_mask & DBG_POWERMGT_CFM)
-            printk(KERN_DEBUG "%s: PowerMgtCfm  status %d\n",
-                   cb->name, le16_to_cpu(cfm.Status));
-#if TRACE_NR_RECS > 0
-          if (cb->trace_mask & (1 << TRACE_MSG_RCV))
-            trace_add(cb, TRACE_MSG_RCV, &cfm.SignalID, 4);
-#endif
-        }
-        break;
-
-      case ReassocConfirm_ID:
-        if ((cb->msg_from_dbg_mask & DBG_REASSOC_CFM) || 
-            (cb->trace_mask & (1 << TRACE_MSG_RCV))) {
-          ReassocCfm_t cfm;
-          copy_from_card(&cfm, msgbuf, sizeof(cfm), COPY_FAST, cb);
-          assert(cfm.SignalID == ReassocConfirm_ID);
-          if (cb->msg_from_dbg_mask & DBG_REASSOC_CFM)
-            printk(KERN_DEBUG "%s: ReassocCfm  status %d\n",
-                   cb->name, le16_to_cpu(cfm.Status));
-#if TRACE_NR_RECS > 0
-          if (cb->trace_mask & (1 << TRACE_MSG_RCV))
-            trace_add(cb, TRACE_MSG_RCV, &cfm.SignalID, 4);
-#endif
-        }
-        break;
-
-      case ReassocIndicate_ID:
-        if ((cb->msg_from_dbg_mask & DBG_REASSOC_IND) || 
-            (cb->trace_mask & (1 << TRACE_MSG_RCV))) {
-          ReassocInd_t ind;
-
-          copy_from_card(&ind, msgbuf, sizeof(ind), COPY_FAST, cb);
-          assert(ind.SignalID == ReassocIndicate_ID);
-          if (cb->msg_from_dbg_mask & DBG_REASSOC_IND) {
-            printk(KERN_DEBUG "%s: ReassocInd "
-                   "MAC %02x:%02x:%02x:%02x:%02x:%02x\n",
-                   cb->name,
-                   ind.MacAddress[0],ind.MacAddress[1],ind.MacAddress[2],
-                   ind.MacAddress[3],ind.MacAddress[4],ind.MacAddress[5]);
-          }
-#if TRACE_NR_RECS > 0
-          if (cb->trace_mask & (1 << TRACE_MSG_RCV))
-            trace_add(cb, TRACE_MSG_RCV, &ind.SignalID, 8);
-#endif
-        }
-        break;
-
-      case ScanConfirm_ID:
-        if ((cb->msg_from_dbg_mask & DBG_SCAN_CFM) || 
-            (cb->trace_mask & (1 << TRACE_MSG_RCV))) {
-          ScanCfm_t cfm;
-          uint16 status;
-          copy_from_card(&cfm, msgbuf, sizeof(cfm), COPY_FAST, cb);
-          assert(cfm.SignalID == ScanConfirm_ID);
-          status = le16_to_cpu(cfm.Status);
-          if (cb->msg_from_dbg_mask & DBG_SCAN_CFM) {
-            if (status != Status_Success)
-              printk(KERN_DEBUG "%s: ScanCfm status %d\n", cb->name, status);
-            else {
-              char sbuf[33]; /* copy of cfm.SSID for printing */
-              /* add trailing '\0' at ssid copy  */
-              memcpy(sbuf,&cfm.SSID[2],MIN(sizeof(sbuf)-1,cfm.SSID[1]));
-              sbuf[MIN(sizeof(sbuf)-1,cfm.SSID[1])] = '\0';
-
-              printk(KERN_DEBUG "%s: ScanCfm chan %d cap x%04x rssi %d "
-                     "BSSID: %02x:%02x:%02x:%02x:%02x:%02x "
-                     "SSID len %d: %s\n",
-                     cb->name, cfm.PHYpset[2], le16_to_cpu(cfm.CapabilityInfo),
-                     cfm.RSSI,
-                     cfm.BSSID[0],cfm.BSSID[1],cfm.BSSID[2],
-                     cfm.BSSID[3],cfm.BSSID[4],cfm.BSSID[5],
-                     cfm.SSID[1], sbuf);
-            }
-          } /* if (cb->msg_from_dbg_mask & DBG_SCAN_CFM) */
-
-#if TRACE_NR_RECS > 0
-          if (cb->trace_mask & (1 << TRACE_MSG_RCV)) {
-#define FIXED_LEN (1+2+1+2+SZ_MAC_ADDR+1)
-            uint8 buf[FIXED_LEN+32];
-            int ssid_len = MIN(32,cfm.SSID[1]);
-            buf[0] = cfm.SignalID;
-            memcpy(buf+1,&cfm.Status, 2);
-	    if (le16_to_cpu(cfm.Status) == Status_Success) {
-	      buf[3] = cfm.BSSType;
-	      memcpy(buf+4,&cfm.CapabilityInfo,2);
-	      memcpy(buf+6,cfm.BSSID,6);
-	      buf[12] = cfm.PHYpset[2];
-	      memcpy(buf+FIXED_LEN, cfm.SSID+2, ssid_len);
-	      trace_add(cb, TRACE_MSG_RCV, buf, FIXED_LEN+ssid_len);
-	    } else
-	      trace_add(cb, TRACE_MSG_RCV, buf, 3);
-
-#undef FIXED_LEN
-          } 
-#endif
-        }
-        break;
-
-
-      case SetConfirm_ID:
-        if ((cb->msg_from_dbg_mask & DBG_SET_CFM) || 
-            (cb->trace_mask & (1 << TRACE_MSG_RCV))) {
-          SetCfm_t cfm;
-          copy_from_card(&cfm, msgbuf, sizeof(cfm), COPY_FAST, cb);
-          assert(cfm.SignalID == SetConfirm_ID);
-          if (cb->msg_from_dbg_mask & DBG_SET_CFM)
-            printk(KERN_DEBUG "%s: SetCfm  status %d attr %d\n",
-                   cb->name, le16_to_cpu(cfm.MibStatus),le16_to_cpu(cfm.MibAttrib));
-#if TRACE_NR_RECS > 0
-          if (cb->trace_mask & (1 << TRACE_MSG_RCV))
-            trace_add(cb, TRACE_MSG_RCV, &cfm.SignalID, 6);
-#endif
-        }
-        break;
-
-      case StartConfirm_ID:
-        if ((cb->msg_from_dbg_mask & DBG_START_CFM) || 
-            (cb->trace_mask & (1 << TRACE_MSG_RCV))) {
-          StartCfm_t cfm;
-          copy_from_card(&cfm, msgbuf, sizeof(cfm), COPY_FAST, cb);
-          assert(cfm.SignalID == StartConfirm_ID);
-
-          if (cb->msg_from_dbg_mask & DBG_START_CFM) {
-            if (le16_to_cpu(cfm.Status) == Status_Success)
-              printk(KERN_DEBUG "%s: StartCfm success\n", cb->name);
-            else
-              printk(KERN_DEBUG "%s: StartCfm failed status %d\n",
-                     cb->name, le16_to_cpu(cfm.Status));
-          }
-
-#if TRACE_NR_RECS > 0
-          if (cb->trace_mask & (1 << TRACE_MSG_RCV))
-            trace_add(cb, TRACE_MSG_RCV, &cfm.SignalID, 4);
-#endif
-        }
-        break;
-
-      case ResyncConfirm_ID:
-        if ((cb->msg_from_dbg_mask & DBG_RESYNC_CFM) || 
-            (cb->trace_mask & (1 << TRACE_MSG_RCV))) {
-          ResyncCfm_t cfm;
-          copy_from_card(&cfm, msgbuf, sizeof(cfm), COPY_FAST, cb);
-          assert(cfm.SignalID == ResyncConfirm_ID);
-          if (cb->msg_from_dbg_mask & DBG_RESYNC_CFM)
-            printk(KERN_DEBUG "%s: ResyncCfm  status %d\n",
-                   cb->name, le16_to_cpu(cfm.Status));
-#if TRACE_NR_RECS > 0
-          if (cb->trace_mask & (1 << TRACE_MSG_RCV))
-            trace_add(cb, TRACE_MSG_RCV, &cfm.SignalID, 2);
-#endif
-        }
-        break;
-
-      case SiteConfirm_ID:
-        if ((cb->msg_from_dbg_mask & DBG_SITE_CFM) || 
-            (cb->trace_mask & (1 << TRACE_MSG_RCV))) {
-          SiteCfm_t cfm;
-          int i;
-          copy_from_card(&cfm, msgbuf, sizeof(cfm), COPY_FAST, cb);
-          assert(cfm.SignalID == SiteConfirm_ID);
-          if (cb->msg_from_dbg_mask & DBG_SITE_CFM) {
-            printk(KERN_DEBUG "%s: SiteCfm  status %d ",
-                   cb->name, le16_to_cpu(cfm.Status));
-            /* output too long ??? */
-            for(i=0;i < sizeof(cfm.RSSI);i++) printk("%02x",cfm.RSSI[i]);
-            printk("\n");
-          }
-
-#if TRACE_NR_RECS > 0
-          if (cb->trace_mask & (1 << TRACE_MSG_RCV))
-            /* include the first 21 RSSI values */
-            trace_add(cb, TRACE_MSG_RCV, &cfm.SignalID, 10+15);
-#endif
-        }
-        break;
-
-      case SaveConfirm_ID:
-        if ((cb->msg_from_dbg_mask & DBG_SAVE_CFM) || 
-            (cb->trace_mask & (1 << TRACE_MSG_RCV))) {
-          SaveCfm_t cfm;
-          copy_from_card(&cfm, msgbuf, sizeof(cfm), COPY_FAST, cb);
-          assert(cfm.SignalID == SaveConfirm_ID);
-          if (cb->msg_from_dbg_mask & DBG_SAVE_CFM) 
-            printk(KERN_DEBUG "%s: SaveCfm  status %d\n",
-                   cb->name, le16_to_cpu(cfm.Status));
-#if TRACE_NR_RECS > 0
-          if (cb->trace_mask & (1 << TRACE_MSG_RCV))
-            trace_add(cb, TRACE_MSG_RCV, &cfm.SignalID, 2);
-#endif
-        }
-        break;
-
-      case RFtestConfirm_ID:
-        if ((cb->msg_from_dbg_mask & DBG_RFTEST_CFM) || 
-            (cb->trace_mask & (1 << TRACE_MSG_RCV))) {
-          RFtestCfm_t cfm;
-          int i;
-          copy_from_card(&cfm, msgbuf, sizeof(cfm), COPY_FAST, cb);
-          assert(cfm.SignalID == RFtestConfirm_ID);
-          if (cb->msg_from_dbg_mask & DBG_RFTEST_CFM) {
-            printk(KERN_DEBUG "%s: RFtestCfm ", cb->name);
-            for(i=0;i < sizeof(cfm.unknown);i++) printk("%02x",cfm.unknown[i]);
-            printk("\n");
-          }
-#if TRACE_NR_RECS > 0
-          if (cb->trace_mask & (1 << TRACE_MSG_RCV))
-            trace_add(cb, TRACE_MSG_RCV, (uint8 *)&cfm.SignalID, 10);
-#endif
-        }
-        break;
-
-      default:
-        /* dump first 32 byte (incl. signalID of unknown messages) */
-      {
+      /* output first 32 bytes of data */
+      if (cb->msg_from_dbg_mask & DBG_MDIND_DATA) {
         uint8 buf[32];
         int i;
-	Card_ESBQ_t esbq_cfm;
+        copy_from_card(buf, ind.Data+sizeof(RxHeader_t), sizeof(buf),
+                       COPY_FAST, cb);
+        printk(KERN_DEBUG "%s: MdInd Data ", cb->name);
+        for(i=0; i < sizeof(buf); i++) printk("%02x",buf[i]);
+        printk("\n");
+      }
+#if TRACE_NR_RECS > 0
+      if (cb->trace_mask & (1 << TRACE_MSG_RCV)) {
+        uint8 buf[1+6+6+2+1];
+        buf[0] = ind.SignalID;
+        memcpy(buf+1, ind.DAddr, 6);
+        memcpy(buf+7, ind.SAddr, 6);
+        memcpy(buf+13, &rxhead.Length, 2);
+        buf[15] = rxhead.RSSI;
+        trace_add(cb, TRACE_MSG_RCV, buf, sizeof(buf));
+      }
+#endif
+    } /* if (cb->msg_from_dbg_mask & DBG_MDIND) */
+    break;
 
-        copy_from_card(&buf, msgbuf+2, sizeof(buf), COPY_FAST, cb);
-        copy_words_from_card((uint16 *)&esbq_cfm, cb->ESBQCfm, SZ_ESBQ_W, cb);
-        printk(KERN_DEBUG "%s: ESBQ Cfm @ x%x: owner x%x buf x%x,"
-               " unknown msg x%x from card @ x%x+2: ", 
-               cb->name, cb->ESBQCfm, esbq_cfm.owner, esbq_cfm.buf, sigid, msgbuf);
+  case AssocConfirm_ID:
+    if ((cb->msg_from_dbg_mask & DBG_ASSOC_CFM) ||
+        (cb->trace_mask & (1 << TRACE_MSG_RCV))) {
+      AssocCfm_t cfm;
+      copy_from_card(&cfm, msgbuf, sizeof(cfm), COPY_FAST, cb);
+      assert(cfm.SignalID == AssocConfirm_ID);
+
+      if (cb->msg_from_dbg_mask & DBG_ASSOC_CFM)
+        printk(KERN_DEBUG "%s: AssocCfm status %d\n",
+               cb->name, le16_to_cpu(cfm.Status));
+#if TRACE_NR_RECS > 0
+      if (cb->trace_mask & (1 << TRACE_MSG_RCV))
+        trace_add(cb, TRACE_MSG_RCV, &cfm.SignalID, 4);
+#endif
+    }
+    break;
+
+  case AssocIndicate_ID:
+    if ((cb->msg_from_dbg_mask & DBG_ASSOC_IND) ||
+        (cb->trace_mask & (1 << TRACE_MSG_RCV))) {
+      AssocInd_t ind;
+      copy_from_card(&ind, msgbuf, sizeof(ind), COPY_FAST, cb);
+      assert(ind.SignalID == AssocIndicate_ID);
+
+      if (cb->msg_from_dbg_mask & DBG_ASSOC_IND)
+        printk(KERN_DEBUG "%s: AssocIndicate %02x:%02x:%02x:%02x:%02x:%02x\n",
+               cb->name,
+               ind.MacAddress[0],ind.MacAddress[1],ind.MacAddress[2],
+               ind.MacAddress[3],ind.MacAddress[4],ind.MacAddress[5]);
+#if TRACE_NR_RECS > 0
+      if (cb->trace_mask & (1 << TRACE_MSG_RCV))
+        trace_add(cb, TRACE_MSG_RCV, &ind.SignalID, 7);
+#endif
+    }
+    break;
+    
+  case AuthConfirm_ID:
+    if ((cb->msg_from_dbg_mask & DBG_AUTH_CFM) ||
+        (cb->trace_mask & (1 << TRACE_MSG_RCV))) {
+      AuthCfm_t cfm;
+
+      copy_from_card(&cfm, msgbuf, sizeof(cfm), COPY_FAST, cb);
+      assert(cfm.SignalID == AuthConfirm_ID);
+      if (cb->msg_from_dbg_mask & DBG_AUTH_CFM)
+        printk(KERN_DEBUG "%s: AuthCfm  type %d status %d "
+               "MAC %02x:%02x:%02x:%02x:%02x:%02x\n",
+               cb->name, le16_to_cpu(cfm.Type), le16_to_cpu(cfm.Status),
+               cfm.MacAddress[0],cfm.MacAddress[1],cfm.MacAddress[2],
+               cfm.MacAddress[3],cfm.MacAddress[4],cfm.MacAddress[5]);
+#if TRACE_NR_RECS > 0
+      if (cb->trace_mask & (1 << TRACE_MSG_RCV))
+        trace_add(cb, TRACE_MSG_RCV, &cfm.SignalID, 12);
+#endif
+    }
+    break;
+
+  case AuthIndicate_ID:
+    if ((cb->msg_from_dbg_mask & DBG_AUTH_IND) ||
+        (cb->trace_mask & (1 << TRACE_MSG_RCV))) {
+      AuthInd_t ind;
+
+      copy_from_card(&ind, msgbuf, sizeof(ind), COPY_FAST, cb);
+      assert(ind.SignalID == AuthIndicate_ID);
+      if (cb->msg_from_dbg_mask & DBG_AUTH_IND)
+        printk(KERN_DEBUG "%s: AuthInd  type %d "
+               "MAC %02x:%02x:%02x:%02x:%02x:%02x\n",
+               cb->name, le16_to_cpu(ind.Type),
+               ind.MacAddress[0],ind.MacAddress[1],ind.MacAddress[2],
+               ind.MacAddress[3],ind.MacAddress[4],ind.MacAddress[5]);
+#if TRACE_NR_RECS > 0
+      if (cb->trace_mask & (1 << TRACE_MSG_RCV))
+        trace_add(cb, TRACE_MSG_RCV, &ind.SignalID, 10);
+#endif
+    }
+    break;
+
+  case DeauthConfirm_ID:
+    if ((cb->msg_from_dbg_mask & DBG_DEAUTH_CFM) ||
+        (cb->trace_mask & (1 << TRACE_MSG_RCV))) {
+      DeauthCfm_t cfm;
+
+      copy_from_card(&cfm, msgbuf, sizeof(cfm), COPY_FAST, cb);
+      assert(cfm.SignalID == DeauthConfirm_ID);
+
+      if (cb->msg_from_dbg_mask & DBG_DEAUTH_CFM)
+        printk(KERN_DEBUG "%s: DeauthCfm  status %d "
+               "MAC %02x:%02x:%02x:%02x:%02x:%02x\n",
+               cb->name, le16_to_cpu(cfm.Status),
+               cfm.MacAddress[0],cfm.MacAddress[1],cfm.MacAddress[2],
+               cfm.MacAddress[3],cfm.MacAddress[4],cfm.MacAddress[5]);
+#if TRACE_NR_RECS > 0
+      if (cb->trace_mask & (1 << TRACE_MSG_RCV))
+        trace_add(cb, TRACE_MSG_RCV, &cfm.SignalID, 10);
+#endif
+    }
+    break;
+
+  case DeauthIndicate_ID:
+    if ((cb->msg_from_dbg_mask & DBG_DEAUTH_IND) ||
+        (cb->trace_mask & (1 << TRACE_MSG_RCV))) {
+      DeauthInd_t ind;
+
+      copy_from_card(&ind, msgbuf, sizeof(ind), COPY_FAST, cb);
+      assert(ind.SignalID == DeauthIndicate_ID);
+      if (cb->msg_from_dbg_mask & DBG_DEAUTH_IND)
+        printk(KERN_DEBUG "%s: DeauthInd reason %d "
+               "MAC %02x:%02x:%02x:%02x:%02x:%02x\n",
+               cb->name, le16_to_cpu(ind.Reason),
+               ind.MacAddress[0],ind.MacAddress[1],ind.MacAddress[2],
+               ind.MacAddress[3],ind.MacAddress[4],ind.MacAddress[5]);
+#if TRACE_NR_RECS > 0
+      if (cb->trace_mask & (1 << TRACE_MSG_RCV))
+        trace_add(cb, TRACE_MSG_RCV, &ind.SignalID, 10);
+#endif
+    }
+    break;
+
+  case DisassocConfirm_ID:
+    if ((cb->msg_from_dbg_mask & DBG_DISASSOC_CFM) || 
+        (cb->trace_mask & (1 << TRACE_MSG_RCV))) {
+      DisassocCfm_t cfm;
+
+      copy_from_card(&cfm, msgbuf, sizeof(cfm), COPY_FAST, cb);
+      assert(cfm.SignalID == DisassocConfirm_ID);
+      if (cb->msg_from_dbg_mask & DBG_DISASSOC_CFM)
+        printk(KERN_DEBUG "%s: DisassocCfm  status %d\n",
+               cb->name, le16_to_cpu(cfm.Status));
+#if TRACE_NR_RECS > 0
+      if (cb->trace_mask & (1 << TRACE_MSG_RCV))
+        trace_add(cb, TRACE_MSG_RCV, &cfm.SignalID, 4);
+#endif
+    }
+    break;
+
+  case DisassocIndicate_ID:
+    if ((cb->msg_from_dbg_mask & DBG_DISASSOC_IND) || 
+        (cb->trace_mask & (1 << TRACE_MSG_RCV))) {
+      DisassocInd_t ind;
+
+      copy_from_card(&ind, msgbuf, sizeof(ind), COPY_FAST, cb);
+      assert(ind.SignalID == DisassocIndicate_ID);
+      if (cb->msg_from_dbg_mask & DBG_DISASSOC_IND)
+        printk(KERN_DEBUG "%s: DisassocInd reason %d "
+               "MAC %02x:%02x:%02x:%02x:%02x:%02x\n",
+               cb->name, le16_to_cpu(ind.Reason),
+               ind.MacAddress[0],ind.MacAddress[1],ind.MacAddress[2],
+               ind.MacAddress[3],ind.MacAddress[4],ind.MacAddress[5]);
+#if TRACE_NR_RECS > 0
+      if (cb->trace_mask & (1 << TRACE_MSG_RCV))
+        trace_add(cb, TRACE_MSG_RCV, &ind.SignalID, 10);
+#endif
+    }
+    break;
+
+  case GetConfirm_ID:
+    if ((cb->msg_from_dbg_mask & DBG_GET_CFM) || 
+        (cb->trace_mask & (1 << TRACE_MSG_RCV))) {
+      GetCfm_t cfm;
+
+      copy_from_card(&cfm, msgbuf, sizeof(cfm), COPY_FAST, cb);
+      assert(cfm.SignalID == GetConfirm_ID);
+
+      if (cb->msg_from_dbg_mask & DBG_GET_CFM) {
+        int i;
+        printk(KERN_DEBUG "%s: GetCfm  status %d attr %d val ",
+               cb->name, le16_to_cpu(cfm.MibStatus),le16_to_cpu(cfm.MibAttrib));
+        for(i=0;i<32;i++) printk("%02x",cfm.MibValue[i]);
+        printk("\n");
+      }
+
+#if TRACE_NR_RECS > 0
+      if (cb->trace_mask & (1 << TRACE_MSG_RCV))
+        trace_add(cb, TRACE_MSG_RCV, &cfm.SignalID, 10);
+#endif
+    }
+    break;
+
+  case JoinConfirm_ID:
+    if ((cb->msg_from_dbg_mask & DBG_JOIN_CFM) || 
+        (cb->trace_mask & (1 << TRACE_MSG_RCV))){
+      JoinCfm_t cfm;
+      uint16 status;
+      BSSDesc_t *bss = &cb->BSSset[cb->currBSS];
+
+      copy_from_card(&cfm, msgbuf, sizeof(cfm), COPY_FAST, cb);
+      assert(cfm.SignalID == JoinConfirm_ID);
+      status = le16_to_cpu(cfm.Status);
+      if (cb->msg_from_dbg_mask & DBG_JOIN_CFM) {
+        if (status != Status_Success)
+          printk(KERN_DEBUG "%s: JoinCfm failed status %d\n", cb->name, status);
+        else {
+          printk("%s: Joining BSSID: %02x:%02x:%02x:%02x:%02x:%02x "
+                 "SSID len (%d)%s (",
+                 cb->name,
+                 bss->BSSID[0],bss->BSSID[1],bss->BSSID[2],
+                 bss->BSSID[3],bss->BSSID[4],bss->BSSID[5],
+                 bss->SSID[1], bss->SSID+2);
+          dumpk(bss->SSID+2, bss->SSID[1]);
+          printk(") chan %d cap x%04x rssi %d\n",
+                 bss->PHYpset[2],
+                 bss->CapabilityInfo, bss->ScanRSSI);
+        }
+      }
+#if TRACE_NR_RECS > 0
+      if (cb->trace_mask & (1 << TRACE_MSG_RCV))
+        trace_add(cb, TRACE_MSG_RCV, &cfm.SignalID, 4);
+#endif
+    }
+    break;
+
+  case PowermgtConfirm_ID:
+    if ((cb->msg_from_dbg_mask & DBG_POWERMGT_CFM)  || 
+        (cb->trace_mask & (1 << TRACE_MSG_RCV))) {
+      PowerMgtCfm_t cfm;
+      copy_from_card(&cfm, msgbuf, sizeof(cfm), COPY_FAST, cb);
+      assert(cfm.SignalID == PowermgtConfirm_ID);
+
+      if (cb->msg_from_dbg_mask & DBG_POWERMGT_CFM)
+        printk(KERN_DEBUG "%s: PowerMgtCfm  status %d\n",
+               cb->name, le16_to_cpu(cfm.Status));
+#if TRACE_NR_RECS > 0
+      if (cb->trace_mask & (1 << TRACE_MSG_RCV))
+        trace_add(cb, TRACE_MSG_RCV, &cfm.SignalID, 4);
+#endif
+    }
+    break;
+
+  case ReassocConfirm_ID:
+    if ((cb->msg_from_dbg_mask & DBG_REASSOC_CFM) || 
+        (cb->trace_mask & (1 << TRACE_MSG_RCV))) {
+      ReassocCfm_t cfm;
+      copy_from_card(&cfm, msgbuf, sizeof(cfm), COPY_FAST, cb);
+      assert(cfm.SignalID == ReassocConfirm_ID);
+      if (cb->msg_from_dbg_mask & DBG_REASSOC_CFM)
+        printk(KERN_DEBUG "%s: ReassocCfm  status %d\n",
+               cb->name, le16_to_cpu(cfm.Status));
+#if TRACE_NR_RECS > 0
+      if (cb->trace_mask & (1 << TRACE_MSG_RCV))
+        trace_add(cb, TRACE_MSG_RCV, &cfm.SignalID, 4);
+#endif
+    }
+    break;
+
+  case ReassocIndicate_ID:
+    if ((cb->msg_from_dbg_mask & DBG_REASSOC_IND) || 
+        (cb->trace_mask & (1 << TRACE_MSG_RCV))) {
+      ReassocInd_t ind;
+
+      copy_from_card(&ind, msgbuf, sizeof(ind), COPY_FAST, cb);
+      assert(ind.SignalID == ReassocIndicate_ID);
+      if (cb->msg_from_dbg_mask & DBG_REASSOC_IND) {
+        printk(KERN_DEBUG "%s: ReassocInd "
+               "MAC %02x:%02x:%02x:%02x:%02x:%02x\n",
+               cb->name,
+               ind.MacAddress[0],ind.MacAddress[1],ind.MacAddress[2],
+               ind.MacAddress[3],ind.MacAddress[4],ind.MacAddress[5]);
+      }
+#if TRACE_NR_RECS > 0
+      if (cb->trace_mask & (1 << TRACE_MSG_RCV))
+        trace_add(cb, TRACE_MSG_RCV, &ind.SignalID, 8);
+#endif
+    }
+    break;
+
+  case ScanConfirm_ID:
+    if ((cb->msg_from_dbg_mask & DBG_SCAN_CFM) || 
+        (cb->trace_mask & (1 << TRACE_MSG_RCV))) {
+      ScanCfm_t cfm;
+      uint16 status;
+      copy_from_card(&cfm, msgbuf, sizeof(cfm), COPY_FAST, cb);
+      assert(cfm.SignalID == ScanConfirm_ID);
+      status = le16_to_cpu(cfm.Status);
+      if (cb->msg_from_dbg_mask & DBG_SCAN_CFM) {
+        if (status != Status_Success)
+          printk(KERN_DEBUG "%s: ScanCfm status %d\n", cb->name, status);
+        else {
+          char sbuf[33]; /* copy of cfm.SSID for printing */
+          /* add trailing '\0' at ssid copy  */
+          memcpy(sbuf,&cfm.SSID[2],MIN(sizeof(sbuf)-1,cfm.SSID[1]));
+          sbuf[MIN(sizeof(sbuf)-1,cfm.SSID[1])] = '\0';
+
+          printk(KERN_DEBUG "%s: ScanCfm chan %d cap x%04x rssi %d "
+                 "BSSID: %02x:%02x:%02x:%02x:%02x:%02x "
+                 "SSID (%d)%s (",
+                 cb->name, cfm.PHYpset[2], le16_to_cpu(cfm.CapabilityInfo),
+                 cfm.RSSI,
+                 cfm.BSSID[0],cfm.BSSID[1],cfm.BSSID[2],
+                 cfm.BSSID[3],cfm.BSSID[4],cfm.BSSID[5],
+                 cfm.SSID[1], sbuf);
+          dumpk(&cfm.SSID[2],cfm.SSID[1]);
+          printk(")\n");
+        }
+      } /* if (cb->msg_from_dbg_mask & DBG_SCAN_CFM) */
+
+#if TRACE_NR_RECS > 0
+      if (cb->trace_mask & (1 << TRACE_MSG_RCV)) {
+#define FIXED_LEN (1+2+1+2+SZ_MAC_ADDR+1)
+        uint8 buf[FIXED_LEN+32];
+        int ssid_len = MIN(32,cfm.SSID[1]);
+        buf[0] = cfm.SignalID;
+        memcpy(buf+1,&cfm.Status, 2);
+        if (le16_to_cpu(cfm.Status) == Status_Success) {
+          buf[3] = cfm.BSSType;
+          memcpy(buf+4,&cfm.CapabilityInfo,2);
+          memcpy(buf+6,cfm.BSSID,6);
+          buf[12] = cfm.PHYpset[2];
+          memcpy(buf+FIXED_LEN, cfm.SSID+2, ssid_len);
+          trace_add(cb, TRACE_MSG_RCV, buf, FIXED_LEN+ssid_len);
+        } else
+          trace_add(cb, TRACE_MSG_RCV, buf, 3);
+
+#undef FIXED_LEN
+      } 
+#endif
+    }
+    break;
+
+
+  case SetConfirm_ID:
+    if ((cb->msg_from_dbg_mask & DBG_SET_CFM) || 
+        (cb->trace_mask & (1 << TRACE_MSG_RCV))) {
+      SetCfm_t cfm;
+      copy_from_card(&cfm, msgbuf, sizeof(cfm), COPY_FAST, cb);
+      assert(cfm.SignalID == SetConfirm_ID);
+      if (cb->msg_from_dbg_mask & DBG_SET_CFM)
+        printk(KERN_DEBUG "%s: SetCfm  status %d attr %d\n",
+               cb->name, le16_to_cpu(cfm.MibStatus),le16_to_cpu(cfm.MibAttrib));
+#if TRACE_NR_RECS > 0
+      if (cb->trace_mask & (1 << TRACE_MSG_RCV))
+        trace_add(cb, TRACE_MSG_RCV, &cfm.SignalID, 6);
+#endif
+    }
+    break;
+
+  case StartConfirm_ID:
+    if ((cb->msg_from_dbg_mask & DBG_START_CFM) || 
+        (cb->trace_mask & (1 << TRACE_MSG_RCV))) {
+      StartCfm_t cfm;
+      copy_from_card(&cfm, msgbuf, sizeof(cfm), COPY_FAST, cb);
+      assert(cfm.SignalID == StartConfirm_ID);
+
+      if (cb->msg_from_dbg_mask & DBG_START_CFM) {
+        if (le16_to_cpu(cfm.Status) == Status_Success)
+          printk(KERN_DEBUG "%s: StartCfm success\n", cb->name);
+        else
+          printk(KERN_DEBUG "%s: StartCfm failed status %d\n",
+                 cb->name, le16_to_cpu(cfm.Status));
+      }
+
+#if TRACE_NR_RECS > 0
+      if (cb->trace_mask & (1 << TRACE_MSG_RCV))
+        trace_add(cb, TRACE_MSG_RCV, &cfm.SignalID, 4);
+#endif
+    }
+    break;
+
+  case ResyncConfirm_ID:
+    if ((cb->msg_from_dbg_mask & DBG_RESYNC_CFM) || 
+        (cb->trace_mask & (1 << TRACE_MSG_RCV))) {
+      ResyncCfm_t cfm;
+      copy_from_card(&cfm, msgbuf, sizeof(cfm), COPY_FAST, cb);
+      assert(cfm.SignalID == ResyncConfirm_ID);
+      if (cb->msg_from_dbg_mask & DBG_RESYNC_CFM)
+        printk(KERN_DEBUG "%s: ResyncCfm  status %d\n",
+               cb->name, le16_to_cpu(cfm.Status));
+#if TRACE_NR_RECS > 0
+      if (cb->trace_mask & (1 << TRACE_MSG_RCV))
+        trace_add(cb, TRACE_MSG_RCV, &cfm.SignalID, 2);
+#endif
+    }
+    break;
+
+  case SiteConfirm_ID:
+    if ((cb->msg_from_dbg_mask & DBG_SITE_CFM) || 
+        (cb->trace_mask & (1 << TRACE_MSG_RCV))) {
+      SiteCfm_t cfm;
+      int i;
+      copy_from_card(&cfm, msgbuf, sizeof(cfm), COPY_FAST, cb);
+      assert(cfm.SignalID == SiteConfirm_ID);
+      if (cb->msg_from_dbg_mask & DBG_SITE_CFM) {
+        printk(KERN_DEBUG "%s: SiteCfm  status %d ",
+               cb->name, le16_to_cpu(cfm.Status));
+        /* output too long ??? */
+        for(i=0;i < sizeof(cfm.RSSI);i++) printk("%02x",cfm.RSSI[i]);
+        printk("\n");
+      }
+
+#if TRACE_NR_RECS > 0
+      if (cb->trace_mask & (1 << TRACE_MSG_RCV))
+        /* include the first 21 RSSI values */
+        trace_add(cb, TRACE_MSG_RCV, &cfm.SignalID, 10+15);
+#endif
+    }
+    break;
+
+  case SaveConfirm_ID:
+    if ((cb->msg_from_dbg_mask & DBG_SAVE_CFM) || 
+        (cb->trace_mask & (1 << TRACE_MSG_RCV))) {
+      SaveCfm_t cfm;
+      copy_from_card(&cfm, msgbuf, sizeof(cfm), COPY_FAST, cb);
+      assert(cfm.SignalID == SaveConfirm_ID);
+      if (cb->msg_from_dbg_mask & DBG_SAVE_CFM) 
+        printk(KERN_DEBUG "%s: SaveCfm  status %d\n",
+               cb->name, le16_to_cpu(cfm.Status));
+#if TRACE_NR_RECS > 0
+      if (cb->trace_mask & (1 << TRACE_MSG_RCV))
+        trace_add(cb, TRACE_MSG_RCV, &cfm.SignalID, 2);
+#endif
+    }
+    break;
+
+  case RFtestConfirm_ID:
+    if ((cb->msg_from_dbg_mask & DBG_RFTEST_CFM) || 
+        (cb->trace_mask & (1 << TRACE_MSG_RCV))) {
+      RFtestCfm_t cfm;
+      int i;
+      copy_from_card(&cfm, msgbuf, sizeof(cfm), COPY_FAST, cb);
+      assert(cfm.SignalID == RFtestConfirm_ID);
+      if (cb->msg_from_dbg_mask & DBG_RFTEST_CFM) {
+        printk(KERN_DEBUG "%s: RFtestCfm ", cb->name);
+        for(i=0;i < sizeof(cfm.unknown);i++) printk("%02x",cfm.unknown[i]);
+        printk("\n");
+      }
+#if TRACE_NR_RECS > 0
+      if (cb->trace_mask & (1 << TRACE_MSG_RCV))
+        trace_add(cb, TRACE_MSG_RCV, (uint8 *)&cfm.SignalID, 10);
+#endif
+    }
+    break;
+
+  default:
+    /* dump first 32 byte (incl. signalID of unknown messages) */
+    {
+      uint8 buf[32];
+      int i;
+      Card_ESBQ_t esbq_cfm;
+
+      copy_from_card(&buf, msgbuf+2, sizeof(buf), COPY_FAST, cb);
+      copy_words_from_card((uint16 *)&esbq_cfm, cb->ESBQCfm, SZ_ESBQ_W, cb);
+      printk(KERN_DEBUG "%s: ESBQ Cfm @ x%x: owner x%x buf x%x,"
+             " unknown msg x%x from card @ x%x+2: ", 
+             cb->name, cb->ESBQCfm, esbq_cfm.owner, esbq_cfm.buf, sigid, msgbuf);
+      for(i=0;i<sizeof(buf);i++)
+        printk("%02x",buf[i]);
+      printk("\n");
+
+      if (esbq_cfm.buf != msgbuf) {
+        /* they should be equal ... */
+        copy_from_card(&buf, esbq_cfm.buf, sizeof(buf), COPY_FAST, cb);
+        printk(KERN_DEBUG "%s: esbq cfm.buf x%x: ", cb->name, esbq_cfm.buf);
         for(i=0;i<sizeof(buf);i++)
           printk("%02x",buf[i]);
         printk("\n");
-
-	if (esbq_cfm.buf != msgbuf) {
-	  /* they should be equal ... */
-	  copy_from_card(&buf, esbq_cfm.buf, sizeof(buf), COPY_FAST, cb);
-	  printk(KERN_DEBUG "%s: esbq cfm.buf x%x: ", cb->name, esbq_cfm.buf);
-	  for(i=0;i<sizeof(buf);i++)
-	    printk("%02x",buf[i]);
-	  printk("\n");
-	}
-#if TRACE_NR_RECS > 0
-        if (cb->trace_mask & (1 << TRACE_MSG_RCV))
-          trace_add(cb, TRACE_MSG_RCV, buf, 10);
-#endif
       }
+#if TRACE_NR_RECS > 0
+      if (cb->trace_mask & (1 << TRACE_MSG_RCV))
+        trace_add(cb, TRACE_MSG_RCV, buf, 10);
+#endif
+    }
   } /* switch (sigid) */
 
 } /* end of debug_msg_from_card */
@@ -4861,8 +5009,8 @@ void wl24n_rxint(WL24Cb_t *cb)
     /* if debug_msg_from_card is called we can trace more specific data
        inside it. Here we get only the id ... */
 # if TRACE_NR_RECS > 0
-  if (cb->trace_mask & (1 << TRACE_MSG_RCV)) 
-    trace_add(TRACE_MSG_RCV, &sigid, 1);
+    if (cb->trace_mask & (1 << TRACE_MSG_RCV)) 
+      trace_add(TRACE_MSG_RCV, &sigid, 1);
 # endif
 #endif
 
@@ -4873,7 +5021,7 @@ void wl24n_rxint(WL24Cb_t *cb)
                      sigid == SetConfirm_ID ? sizeof(SetCfm_t) :
                      sizeof(cb->last_mibcfm), COPY_FAST, cb);
       /* re-start the process waiting in the ioctl for completion
-       of GetMib / SetMib - if there is any !*/
+         of GetMib / SetMib - if there is any !*/
       cb->last_mibcfm_valid = 1;
       wake_up_interruptible(&cb->waitq); /* wake up the process sleeping on queue */
     } else 
@@ -4909,6 +5057,9 @@ void state_invalid(WL24Cb_t *cb, uint8 sigid, Card_Word_t msgbuf)
 /* == PROC find_matching_bss == 
  find a matching BSS from cb->BSSset starting with index first_index.
  compares SSID and BSSType and returns new index or -1 if no BSS found */
+/* Obey that the Belkin AP F5D6130 with unchecked "all SSID ANY" checkbox
+   broadcasts a SSID of the correct length but filled with \0 - even if it's
+	 probed with the correct SSID ! */
 int find_matching_bss(WL24Cb_t *cb, int first_index)
 {
   int i;
@@ -4923,17 +5074,19 @@ int find_matching_bss(WL24Cb_t *cb, int first_index)
 
 #ifdef LOG_FIND_MATCHING_BSS
       printk(KERN_DEBUG "%s %s: comparing %d. entry: cap %04x SSID "
-             "(%d)%s\n",
-	     cb->name, __FUNCTION__, i, bss->CapabilityInfo,
-	     bss->SSID[1], &bss->SSID[2]);
+             "(%d)%s (",
+             cb->name, __FUNCTION__, i, bss->CapabilityInfo,
+             bss->SSID[1], bss->SSID+2);
+      dumpk(bss->SSID+2, bss->SSID[1]);
+      printk(")\n");
 #endif
 
       /* compare if BSSType and SSID match */
       if (!((cb->bsstype == BSSType_Infrastructure &&
-            (bss->CapabilityInfo & CAP_ESS)) ||
-           (cb->bsstype == BSSType_Independent &&
-            (bss->CapabilityInfo & CAP_IBSS)) ||
-           (cb->bsstype == BSSType_AnyBSS))) {
+             (bss->CapabilityInfo & CAP_ESS)) ||
+            (cb->bsstype == BSSType_Independent &&
+             (bss->CapabilityInfo & CAP_IBSS)) ||
+            (cb->bsstype == BSSType_AnyBSS))) {
 
 #ifdef LOG_FIND_MATCHING_BSS
         printk(KERN_DEBUG "%s %s: %d. entry skipped: bsstype %d cap %x \n",
@@ -4948,15 +5101,27 @@ int find_matching_bss(WL24Cb_t *cb, int first_index)
          (i.e. SSID[1] == 0) from an AP in "closed network" mode.
          Make sure that such an entry is never choosen !
          (We leave it in the list for displaying the environment) */
-      if (cb->ESSID[1] != 0 &&
+      if (bss->SSID[1] == 0 ||
+					(cb->ESSID[1] != 0 &&
            (cb->ESSID[1] != bss->SSID[1] ||
-            (memcmp(&cb->ESSID[2],&bss->SSID[2],cb->ESSID[1])))) {
+            (memcmp(&cb->ESSID[2],&bss->SSID[2],cb->ESSID[1]) &&
+						 memcmp(&bss->SSID[2],zeros,bss->SSID[1]))))) {
+
+				/* skip the entry if
+					 (the BSS' SSID is ANY) OR
+           ((we look for an SSID != ANY) AND
+           ((the length of our SSID differs from the entry's SSID) OR
+           ((both SSID differ) AND (the SSID of the BSS is not filled with \0)))) */
 
 #ifdef LOG_FIND_MATCHING_BSS
-        printk(KERN_DEBUG "%s %s: %d. entry skipped: ESSID (%d)%s "
-               "SSID (%d)%s\n", 
+        printk(KERN_DEBUG "%s %s: %d. entry skipped: wanted ESSID (%d)%s ("
                cb->name, __FUNCTION__, i,  cb->ESSID[1],
-               &cb->ESSID[2], bss->SSID[1], &bss->SSID[2]);
+               cb->ESSID+2);
+				dumpk(cb->ESSID+2,cb->ESSID[1]);
+        printk(") entry's SSID (%d)%s (", 
+          bss->SSID[1], &bss->SSID[2]);
+				dumpk(&bss->SSID[2],bss->SSID[1]);
+				printk(")\n");
 #endif
 
         continue;
@@ -4975,30 +5140,47 @@ int find_matching_bss(WL24Cb_t *cb, int first_index)
 /* == PROC add_bss_to_set == */
 void add_bss_to_set(WL24Cb_t *cb, ScanCfm_t *cfm)
 {
-  int i, nr = -1; // nr is the index where we put our new bss into the table
+  int i, nr; /* nr is the index where we write 
+                the BSS info from cfm into cb->BSSset */
   BSSDesc_t *bss;
-  
+
 #ifdef LOG_ADD_BSS_TO_SET
   printk(KERN_DEBUG "%s %s\n",cb->name, __FUNCTION__);
 #endif
 
-  for(i=0,bss=cb->BSSset; i < NR_BSS_DESCRIPTIONS; i++,bss++)
+  /* nr stays -1 as long as we haven't found an entry to put the
+     cfm info into */
+  for(nr=-1, i=0, bss=cb->BSSset; nr == -1 && i < NR_BSS_DESCRIPTIONS;
+      i++,bss++)
     if (!bss->valid) {
-      if (nr == -1)
-	nr = i;
-     } else {
-	if (memcmp(bss->BSSID,cfm->BSSID,sizeof(bss->BSSID)) == 0) {
-	  // we had the BSS already in the table, overwrite the entry
-	  nr = i;
-
+      nr = i;
+    } else {
+      if (memcmp(bss->BSSID,cfm->BSSID,sizeof(bss->BSSID)) == 0) {
+        // we have the BSS already in the table
 #ifdef LOG_ADD_BSS_TO_SET
-	  printk(KERN_DEBUG "%s %s: BSS already in %d. entry\n",
-           cb->name, __FUNCTION__, nr);
+        printk(KERN_DEBUG "%s %s: BSS already in %d. entry\n",
+               cb->name, __FUNCTION__, nr);
 #endif
-
-	  break;
-	}
+        /* if the old entry has a non-empty SSID and the new one an empty
+           do not overwrite, but skip this info */
+        if (bss->SSID[1] != 0 && cfm->SSID[1] == 0) {
+#ifdef LOG_ADD_BSS_TO_SET
+          printk(KERN_DEBUG "%s %s: skipped ScanCfm with empty SSID for BSSID "
+                 "%02x:%02:%02x:%02x:%02:%02x with SSID (%d)%s (",
+                 cb->name, __FUNCTION__,
+                 bss->BSSID[0],bss->BSSID[1],bss->BSSID[2],
+                 bss->BSSID[3],bss->BSSID[4],bss->BSSID[5],
+                 bss->SSID[1], bss->SSID+2);
+          dumpk(bss->SSID+2, bss->SSID[1]);
+          printk(")\n");
+#endif
+          return;
+				} else 
+					/* (bss->SSID is empty OR cfm->SSID is not empty)
+             --> overwrite the entry */
+          nr = i;
       }
+    } /* if (!bss->valid) ... else ... */
       
   if (nr != -1) {
     bss = &cb->BSSset[nr];
@@ -5016,12 +5198,14 @@ void add_bss_to_set(WL24Cb_t *cb, ScanCfm_t *cfm)
     memcpy(bss->IBSSpset, cfm->IBSSpset, sizeof(bss->IBSSpset));
     bss->CapabilityInfo = le16_to_cpu(cfm->CapabilityInfo);
     memcpy(bss->BSSBasicRateSet, cfm->BSSBasicRateSet,
-	   sizeof(bss->BSSBasicRateSet));
+           sizeof(bss->BSSBasicRateSet));
     bss->ScanRSSI = cfm->RSSI;
 
 #ifdef LOG_ADD_BSS_TO_SET
-    printk(KERN_DEBUG "%s %s: put BSS SSID (%d)%s into %d. entry\n",
-	   cb->name, __FUNCTION__, bss->SSID+1, bss->SSID+2, nr);
+    printk(KERN_DEBUG "%s %s: added %d. entry: BSS SSID (%d)%s (",
+           cb->name, __FUNCTION__, nr, bss->SSID[1], bss->SSID+2);
+    dumpk(bss->SSID+2,bss->SSID[1]);
+    printk(")\n");
 #endif
 
     return;
@@ -5048,17 +5232,17 @@ void try_join_next_bss(WL24Cb_t *cb, int do_restart_if_empty)
     /* we found a matching BSS - try to join it */
 
 #if TRACE_NR_RECS > 0
-  if (cb->trace_mask & (1 << TRACE_TRY_NEW_BSS)) {
-    BSSDesc_t *bss = &cb->BSSset[cb->currBSS];
-    uint8 buf[1+1+2+6+34];
-    buf[0] = bss->PHYpset[2]; /* channel */
-    buf[1] = bss->ScanRSSI;
-    buf[2] = bss->CapabilityInfo >> 8;
-    buf[3] = bss->CapabilityInfo & 0xff;
-    memcpy(buf+4, bss->BSSID, 6);
-    memcpy(buf+4+6, bss->SSID, SIZE_OF_SSID);
-    trace_add(cb, TRACE_TRY_NEW_BSS, buf, 1+1+2+6+2+bss->SSID[1]);
-  }
+    if (cb->trace_mask & (1 << TRACE_TRY_NEW_BSS)) {
+      BSSDesc_t *bss = &cb->BSSset[cb->currBSS];
+      uint8 buf[1+1+2+6+34];
+      buf[0] = bss->PHYpset[2]; /* channel */
+      buf[1] = bss->ScanRSSI;
+      buf[2] = bss->CapabilityInfo >> 8;
+      buf[3] = bss->CapabilityInfo & 0xff;
+      memcpy(buf+4, bss->BSSID, 6);
+      memcpy(buf+4+6, bss->SSID, SIZE_OF_SSID);
+      trace_add(cb, TRACE_TRY_NEW_BSS, buf, 1+1+2+6+2+bss->SSID[1]);
+    }
 #endif
 
     newstate(cb, state_joining);
@@ -5071,19 +5255,19 @@ void try_join_next_bss(WL24Cb_t *cb, int do_restart_if_empty)
       cb->scan_runs++;
       cb->currBSS = -1;
       if (cb->bsstype == BSSType_Infrastructure ||
-	  cb->scan_runs < MAX_SCAN_RUNS_BEFORE_STARTING_IBSS) {
-	int i;
-	for(i=0; i < NR_BSS_DESCRIPTIONS; i++) {
-	  cb->BSSset[i].valid = FALSE;
-	  memset(cb->BSSset[i].SSID,0,sizeof(cb->BSSset[i].SSID));
-	}
-	newstate(cb,state_scanning);
-	ScanReq(cb, SCAN_MIN_CHANNEL_TIME, SCAN_NEXT_RUN_MAX_CHANNEL_TIME,
-		BSSType_AnyBSS, ScanType_Active);
+          cb->scan_runs < MAX_SCAN_RUNS_BEFORE_STARTING_IBSS) {
+        int i;
+        for(i=0; i < NR_BSS_DESCRIPTIONS; i++) {
+          cb->BSSset[i].valid = FALSE;
+          memset(cb->BSSset[i].SSID,0,sizeof(cb->BSSset[i].SSID));
+        }
+        newstate(cb,state_scanning);
+        ScanReq(cb, SCAN_MIN_CHANNEL_TIME, SCAN_NEXT_RUN_MAX_CHANNEL_TIME,
+                BSSType_AnyBSS, ScanType_Active);
       } else {
-	/* start IBSS */
-	newstate(cb,state_starting_ibss);
-	StartReq(cb, cb->Channel, BSSType_Independent);
+        /* start IBSS */
+        newstate(cb,state_starting_ibss);
+        StartReq(cb, cb->Channel, BSSType_Independent);
       }
     }
   }
@@ -5122,35 +5306,35 @@ void state_scanning(WL24Cb_t *cb, uint8 sigid, Card_Word_t msgbuf)
       if (status == Status_Success) {
 
 #if TRACE_NR_RECS > 0
-	if (cb->trace_mask & (1 << TRACE_NEW_BSS_FOUND)) {
-	  uint8 buf[1+1+2+6+34];
-	  buf[0] = cfm.PHYpset[2]; /* channel */
-	  buf[1] = cfm.RSSI;
-	  buf[2] = cfm.CapabilityInfo >> 8;
-	  buf[3] = cfm.CapabilityInfo & 0xff;
-	  memcpy(buf+4, cfm.BSSID, 6);
-	  memcpy(buf+4+6, cfm.SSID, SIZE_OF_SSID);
-	  trace_add(cb, TRACE_NEW_BSS_FOUND, buf, 1+1+2+6+2+cfm.SSID[1]);
-	}
+        if (cb->trace_mask & (1 << TRACE_NEW_BSS_FOUND)) {
+          uint8 buf[1+1+2+6+34];
+          buf[0] = cfm.PHYpset[2]; /* channel */
+          buf[1] = cfm.RSSI;
+          buf[2] = cfm.CapabilityInfo >> 8;
+          buf[3] = cfm.CapabilityInfo & 0xff;
+          memcpy(buf+4, cfm.BSSID, 6);
+          memcpy(buf+4+6, cfm.SSID, SIZE_OF_SSID);
+          trace_add(cb, TRACE_NEW_BSS_FOUND, buf, 1+1+2+6+2+cfm.SSID[1]);
+        }
 #endif
   
-	/* add BSS to list */
-	add_bss_to_set(cb,&cfm);
+        /* add BSS to list */
+        add_bss_to_set(cb,&cfm);
 
       } else if (status == Status_Timeout) {
-	/* try to join a matching BSS from BSSset */
-	try_join_next_bss(cb, FALSE);
+        /* try to join a matching BSS from BSSset */
+        try_join_next_bss(cb, FALSE);
       } else {
-	printk( KERN_WARNING "%s: ScanCfm unknown status x%x\n",cb->name,
-		status);
-	try_join_next_bss(cb, FALSE);
+        printk( KERN_WARNING "%s: ScanCfm unknown status x%x\n",cb->name,
+                status);
+        try_join_next_bss(cb, FALSE);
       }
     }
     break;
 
   default:
     printk(KERN_WARNING "%s: state SCANNING: got unexpected signal %d\n",
-	   cb->name, sigid);
+           cb->name, sigid);
   } /* switch(sigid) */
 } /* end of state_scanning */
 
@@ -5160,70 +5344,70 @@ void state_scanning(WL24Cb_t *cb, uint8 sigid, Card_Word_t msgbuf)
 void state_joining(WL24Cb_t *cb, uint8 sigid, Card_Word_t msgbuf)
 {
 
-    switch(sigid) {
+  switch(sigid) {
 
     /* we may still get some MdConfirm_ID from former tx data */
-    case MdConfirm_ID:
-      {
-	MdConfirm_t cfm;
+  case MdConfirm_ID:
+    {
+      MdConfirm_t cfm;
 	
-	copy_from_card(&cfm, msgbuf, sizeof(cfm), COPY_FAST, cb);
-	assert(cfm.SignalID == MdConfirm_ID);
+      copy_from_card(&cfm, msgbuf, sizeof(cfm), COPY_FAST, cb);
+      assert(cfm.SignalID == MdConfirm_ID);
 
-	free_txbuf(cb,cfm.Data);
-      }
-      break;
+      free_txbuf(cb,cfm.Data);
+    }
+    break;
 
-    case JoinConfirm_ID:
-      {
-        JoinCfm_t cfm;
-        uint16 status;
+  case JoinConfirm_ID:
+    {
+      JoinCfm_t cfm;
+      uint16 status;
 
-        copy_from_card(&cfm, msgbuf, sizeof(cfm), COPY_FAST, cb);
-        assert(cfm.SignalID == JoinConfirm_ID);
-        status = le16_to_cpu(cfm.Status);
+      copy_from_card(&cfm, msgbuf, sizeof(cfm), COPY_FAST, cb);
+      assert(cfm.SignalID == JoinConfirm_ID);
+      status = le16_to_cpu(cfm.Status);
 
-        if (status == Status_Success) {
-          if (cb->BSSset[cb->currBSS].CapabilityInfo & CAP_ESS) {
-            newstate(cb,state_auth);
-            AuthReq(cb, AuthType_OpenSystem, AUTH_TIMEOUT,
-                    cb->BSSset[cb->currBSS].BSSID);
-          } else {
-	    BSSDesc_t *bss = &cb->BSSset[cb->currBSS];
-            /* we successfully joined an IBSS */
-            assert(bss->CapabilityInfo & CAP_IBSS);
-            if (cb->dbg_mask & DBG_CONNECTED_BSS) {
-              printk(KERN_DEBUG "%s: connected to IBSS ID "
-                     " %02X:%02X:%02X:%02X:%02X:%02X\n",
-                     cb->name,
-                     bss->BSSID[0],bss->BSSID[1],bss->BSSID[2],
-                     bss->BSSID[3],bss->BSSID[4],bss->BSSID[5]);
-            }
+      if (status == Status_Success) {
+        if (cb->BSSset[cb->currBSS].CapabilityInfo & CAP_ESS) {
+          newstate(cb,state_auth);
+          AuthReq(cb, AuthType_OpenSystem, AUTH_TIMEOUT,
+                  cb->BSSset[cb->currBSS].BSSID);
+        } else {
+          BSSDesc_t *bss = &cb->BSSset[cb->currBSS];
+          /* we successfully joined an IBSS */
+          assert(bss->CapabilityInfo & CAP_IBSS);
+          if (cb->dbg_mask & DBG_CONNECTED_BSS) {
+            printk(KERN_DEBUG "%s: connected to IBSS ID "
+                   " %02X:%02X:%02X:%02X:%02X:%02X\n",
+                   cb->name,
+                   bss->BSSID[0],bss->BSSID[1],bss->BSSID[2],
+                   bss->BSSID[3],bss->BSSID[4],bss->BSSID[5]);
+          }
 
 # ifdef WIRELESS_EXT
-	    /* we start with the Scan RSSI until we get the first MdInd,
-	       which may take a while */
-	    cb->wstats.qual.level = bss->ScanRSSI;
+          /* we start with the Scan RSSI until we get the first MdInd,
+             which may take a while */
+          cb->wstats.qual.level = bss->ScanRSSI;
 # endif
 
-            newstate(cb,state_joined_ibss);
-            /* jal: at first time, we should call netif_start_queue !!! */
+          newstate(cb,state_joined_ibss);
+          /* jal: at first time, we should call netif_start_queue !!! */
 
-	    netif_carrier_on(cb->netdev); /* we got a carrier */
-            netif_wake_queue(cb->netdev);
-          }
-        } else {
-          /* JoinReq failed */
-          /* try to join next matching BSS from BSSset */
-          try_join_next_bss(cb, FALSE);
+          netif_carrier_on(cb->netdev); /* we got a carrier */
+          netif_wake_queue(cb->netdev);
         }
+      } else {
+        /* JoinReq failed */
+        /* try to join next matching BSS from BSSset */
+        try_join_next_bss(cb, FALSE);
       }
-      break;
+    }
+    break;
 
-    default:
-      printk(KERN_WARNING "%s: state JOINING: got unexpected signal %d\n",
-             cb->name, sigid);
-    } /* switch(sigid) */
+  default:
+    printk(KERN_WARNING "%s: state JOINING: got unexpected signal %d\n",
+           cb->name, sigid);
+  } /* switch(sigid) */
 
 } /* end of state_joining */                
 
@@ -5264,33 +5448,39 @@ void state_auth(WL24Cb_t *cb, uint8 sigid, Card_Word_t msgbuf)
 
       if (status == Status_Success) {
         if (cb->dbg_mask & DBG_AUTH_BSS) {
-          printk(KERN_DEBUG "%s: authenticated to ESS SSID len %d: %s BSSID"
-                 " %02X:%02X:%02X:%02X:%02X:%02X\n",
-                 cb->name, bss->SSID[1], bss->SSID+2,
+          printk(KERN_DEBUG "%s: authenticated to BSSID"
+                 " %02X:%02X:%02X:%02X:%02X:%02X SSID (%d)%s (",
+                 cb->name,
                  bss->BSSID[0],bss->BSSID[1],bss->BSSID[2],
-                 bss->BSSID[3],bss->BSSID[4],bss->BSSID[5]);
+                 bss->BSSID[3],bss->BSSID[4],bss->BSSID[5],
+                 bss->SSID[1], bss->SSID+2);
+          dumpk(bss->SSID+2, bss->SSID[1]);
+          printk(")\n");
         }
         AssocReq(cb);
         newstate(cb, state_assoc);
 
       } else {
 
-        printk(KERN_DEBUG "%s: AuthReq failed to ESS chan %d SSID len %d: %s "
-               "BSSID %02X:%02X:%02X:%02X:%02X:%02X (status %d)\n",
-               cb->name, bss->PHYpset[2], bss->SSID[1], bss->SSID+2,
+        printk(KERN_DEBUG "%s: AuthReq failed to BSSID "
+               "%02X:%02X:%02X:%02X:%02X:%02X "
+               "(status %d) chan %d SSID (%d)%s (",
+               cb->name,
                bss->BSSID[0],bss->BSSID[1],bss->BSSID[2],
                bss->BSSID[3],bss->BSSID[4],bss->BSSID[5],
-               status);
+               status, bss->PHYpset[2], bss->SSID[1], bss->SSID+2);
+        dumpk(bss->SSID+2, bss->SSID[1]);
+        printk(")\n");
 
         try_join_next_bss(cb, FALSE);
       }
     }
     break;
 
-    default:
-      printk(KERN_WARNING "%s: state AUTH: got unexpected signal %d\n",
-             cb->name, sigid);
-    } /* switch(sigid) */
+  default:
+    printk(KERN_WARNING "%s: state AUTH: got unexpected signal %d\n",
+           cb->name, sigid);
+  } /* switch(sigid) */
 } /* end of state_auth */
 
 /* == PROC state_assoc ==
@@ -5310,32 +5500,37 @@ void state_assoc(WL24Cb_t *cb, uint8 sigid, Card_Word_t msgbuf)
 
       if (status == Status_Success) {
         if (cb->dbg_mask & DBG_CONNECTED_BSS) {
-          printk(KERN_DEBUG "%s: connected to ESS chan %d SSID len %d: %s BSSID"
-                 " %02X:%02X:%02X:%02X:%02X:%02X (Assoc succeeded)\n",
-                 cb->name, bss->PHYpset[2], bss->SSID[1], bss->SSID+2,
+          printk(KERN_DEBUG "%s: Assoc succeeded to ESS chan %d BSSID"
+                 " %02X:%02X:%02X:%02X:%02X:%02X SSID (%d)%s (",
+                 cb->name, bss->PHYpset[2],
                  bss->BSSID[0],bss->BSSID[1],bss->BSSID[2],
-                 bss->BSSID[3],bss->BSSID[4],bss->BSSID[5]);
+                 bss->BSSID[3],bss->BSSID[4],bss->BSSID[5],
+                 bss->SSID[1], bss->SSID+2);
+          dumpk(bss->SSID+2, bss->SSID[1]);
+          printk(")\n");
         }
 
 # ifdef WIRELESS_EXT
-	    /* we start with the Scan RSSI until we get the first MdInd,
-	       which may take a while */
-	    cb->wstats.qual.level = bss->ScanRSSI;
+        /* we start with the Scan RSSI until we get the first MdInd,
+           which may take a while */
+        cb->wstats.qual.level = bss->ScanRSSI;
 # endif
 
         newstate(cb, state_joined_ess);
-	netif_carrier_on(cb->netdev); /* we got a carrier */
+        netif_carrier_on(cb->netdev); /* we got a carrier */
         /* jal: at first time, we should call netif_start_queue !!! */
         netif_wake_queue(cb->netdev);
 
       } else {
 
-        printk(KERN_DEBUG "%s: AssocReq failed to ESS chan %d SSID len %d: %s "
-               "BSSID %02X:%02X:%02X:%02X:%02X:%02X (status %d)\n",
-               cb->name, bss->PHYpset[2], bss->SSID[1], bss->SSID+2,
+        printk(KERN_DEBUG "%s: AssocReq failed with status %d to chan %d "
+               "BSSID %02X:%02X:%02X:%02X:%02X:%02X SSID (%d)%s (",
+               cb->name, status, bss->PHYpset[2],
                bss->BSSID[0],bss->BSSID[1],bss->BSSID[2],
                bss->BSSID[3],bss->BSSID[4],bss->BSSID[5],
-               status);
+               bss->SSID[1], bss->SSID+2);
+        dumpk(bss->SSID+2, bss->SSID[1]);
+        printk(")\n");
 
         try_join_next_bss(cb, FALSE);
       }
@@ -5399,14 +5594,14 @@ void handle_mdcfm(WL24Cb_t *cb, Card_Word_t msgbuf, int do_leaky_bucket)
 
     if (do_leaky_bucket) {
       if ((cb->mdcfm_failure += MDCFM_FAIL_PENALTY) > MDCFM_RESCAN_THRE) {
-	printk(KERN_DEBUG "%s: %s: too many failed MdConfirm"
-	       " (last status x%x) -> join next BSS/restart\n",
-	       cb->name, __FUNCTION__, status);
-	netif_carrier_off(cb->netdev); /* we lost our carrier */
-	cb->mdcfm_failure = 0;
-	/* look into the BSS table if there is another BSS of the same networkname,
-	   and try to join it first before we restart */
-	try_join_next_bss(cb,TRUE); /* try to join next matching BSS */
+        printk(KERN_DEBUG "%s: %s: too many failed MdConfirm"
+               " (last status x%x) -> join next BSS/restart\n",
+               cb->name, __FUNCTION__, status);
+        netif_carrier_off(cb->netdev); /* we lost our carrier */
+        cb->mdcfm_failure = 0;
+        /* look into the BSS table if there is another BSS of the same networkname,
+           and try to join it first before we restart */
+        try_join_next_bss(cb,TRUE); /* try to join next matching BSS */
       }
     }
   } else {
@@ -5415,17 +5610,17 @@ void handle_mdcfm(WL24Cb_t *cb, Card_Word_t msgbuf, int do_leaky_bucket)
     int nr = (cfm.Data - cb->FreeTxBufStart) / sizeof(Card_TxBuf_t);
     if (nr >= 0 && nr < cb->txbuf_len_list_len) {
       if (cb->txbuf_len_list[nr] > sizeof(TxHeader_t))
-	cb->stats.tx_bytes += cb->txbuf_len_list[nr] - 
-	  sizeof(TxHeader_t);
+        cb->stats.tx_bytes += cb->txbuf_len_list[nr] - 
+          sizeof(TxHeader_t);
       cb->txbuf_len_list[nr] = 0;
     }
     cb->stats.tx_packets++;
 
     if (do_leaky_bucket) {
       if (cb->mdcfm_failure > 0) {
-	cb->mdcfm_failure -= MDCFM_OK_VALUE;
-	if (cb->mdcfm_failure < 0)
-	  cb->mdcfm_failure = 0;
+        cb->mdcfm_failure -= MDCFM_OK_VALUE;
+        if (cb->mdcfm_failure < 0)
+          cb->mdcfm_failure = 0;
       }
     }
   }
@@ -5439,10 +5634,9 @@ void handle_mdind(WL24Cb_t *cb, Card_Word_t msgbuf)
   RxHeader_t hdr;
   struct  sk_buff *skb;
 
-  uint16 nSkip; /* we will skip that many bytes at the start of
-		   MdInd.Data+sizeof(RxHeader_t) */
-  int32 nSize; /* size of skb buffer to allocate */
-  bool insertLen; /* TRUE if we shall insert the packet length */
+  int32 RestLen, ThisLen;
+  char *pBuffer;
+  uint16 ptr;
 
   copy_from_card(&ind, msgbuf, sizeof(ind), COPY_FAST, cb);
   assert(ind.SignalID == MdIndicate_ID);
@@ -5450,15 +5644,64 @@ void handle_mdind(WL24Cb_t *cb, Card_Word_t msgbuf)
   /* get the rx header */
   copy_from_card(&hdr, ind.Data, sizeof(hdr), COPY_FAST, cb);
 
+  /* copy the whole frame to the WEP buffer */
+
+  RestLen = cb->databuffer.length = ind.Size - 4;
+  pBuffer = cb->databuffer.buffer;
+  cb->databuffer.offset = 0;
+  ThisLen = min(RestLen, 210 + 24);
+  copy_from_card(pBuffer, ind.Data + 22, ThisLen, COPY_FAST, cb);
+  pBuffer += ThisLen; RestLen -= ThisLen;
+  copy_words_from_card(&ptr, ind.Data + 2, 1, cb);
+  while (RestLen)
+    {
+      ThisLen = min(RestLen, 251);
+      copy_from_card(pBuffer, ptr + 5, ThisLen, COPY_FAST, cb);
+      pBuffer += ThisLen; RestLen -= ThisLen;
+      copy_words_from_card(&ptr, ptr + 2, 1, cb);
+    }
+  
+  /* decrypt frame ? */
+
+  if (cb->databuffer.buffer[cb->databuffer.offset + 1] & WEPBIT)
+    {
+      if (wl24decrypt(&cb->databuffer, &cb->wepstate))
+        {
+          cb->wstats.discard.code++;
+          return;
+        }
+    }
+
+  /* otherwise discard frame if in restricted mode */
+
+  else if (cb->wepstate.exclude_unencr)
+    {
+      printk(KERN_DEBUG "%s: received unencrypted frame in restricted mode,"
+             " source addr %02X:%02X:%02X:%02X:%02X:%02X\n",
+             cb->name,
+             hdr.Address2[0],hdr.Address2[1],hdr.Address2[2],
+             hdr.Address2[3],hdr.Address2[4],hdr.Address2[5]);
+      cb->wstats.discard.misc++;
+      return;
+    }
+
+  /* convert to 802.3 */
+
+  if (wl24unpack(&cb->databuffer, cb->llctype))
+    {
+      cb->wstats.discard.misc++;
+      return;
+    }
+
 #if IW_MAX_SPY > 0
   {
     int i;
     for(i=0; i < cb->iwspy_number; i++)
       if (!memcmp(cb->iwspy[i].spy_address,
-		  ind.SAddr, ETH_ALEN)) {
-	cb->iwspy[i].spy_level = hdr.RSSI;
-	cb->iwspy[i].updated = 1;
-	break;
+                  cb->databuffer.buffer + cb->databuffer.offset + 6, ETH_ALEN)) {
+        cb->iwspy[i].spy_level = hdr.RSSI;
+        cb->iwspy[i].updated = 1;
+        break;
       }
   }
 #endif
@@ -5475,58 +5718,29 @@ void handle_mdind(WL24Cb_t *cb, Card_Word_t msgbuf)
   cb->wstats.qual.level = hdr.RSSI;
 # endif
 
-  if (cb->llctype == LLCType_WaveLan) {
-    uint16 start;
-
-    copy_from_card(&start, ind.Data+sizeof(RxHeader_t), 2, COPY_FAST, cb);
-    if (start == 0xaaaa) {
-      /* Ethernet SNAP: payload starts with 0xaa,0xaa,0x03,0,0,0,<prot id> */
-      insertLen = FALSE;
-      nSkip = 6; /* skip the SNAP header */
-    } else {
-      /* payload starts with something else: probably a <prot id> -> 
-	 Ethernet II */
-      insertLen = TRUE;
-      nSkip = 0;
-    }
-  } else {
-    /* LLCType is IEEE802.11, payload starts with <dest MAC>, <src MAC>
-       which we'll skip */
-    insertLen = FALSE;
-    nSkip= 2*SZ_MAC_ADDR; /* skip the repeated MAC addr's in the payload */
-  }
-
-  if (ind.Size <= (RXHEADER_HEADER_SIZE + nSkip)) {
+  if (cb->databuffer.length <= 14) {
     /* no payload (the ELSA IL-2 sends every second an empty packet to check
        if their internal PCMCIA card still works) */
 #ifdef LOG_MDIND_NO_PAYLOAD
-    printk(KERN_DEBUG "%s %s: empty MdInd LLCType %d ind.Size %x"
-	   " insertLen %d nSkip %x\n",
-	   cb->name, __FUNCTION__, cb->llctype, ind.Size, 
-	   insertLen, nSkip);
+    printk(KERN_DEBUG "%s %s: empty MdInd LLCType %d BufLen %x\n",
+           cb->name, __FUNCTION__, cb->llctype, BufLen); 
 #endif
     return;
   }
 
-  /* skb: dest MAC | src MAC | [length optional] | data */
-  nSize = 2*SZ_MAC_ADDR + ((insertLen) ? 2 : 0) +
-    (ind.Size - RXHEADER_HEADER_SIZE) - nSkip;
-
 #ifdef LOG_STATE_IBSS_MDIND
-  printk(KERN_DEBUG "%s %s: MdInd LLCType %d ind.Size %x nSize %x"
-	 " insertLen %d nSkip %x\n",
-	 cb->name, __FUNCTION__, cb->llctype, ind.Size, nSize, 
-	 insertLen, nSkip);
+  printk(KERN_DEBUG "%s %s: MdInd LLCType %d ind.Size %x BufLen",
+         cb->name, __FUNCTION__, cb->llctype, ind.Size, BufLen); 
 #endif
 
 #ifdef DEBUG_DONT_PROCESS_MDIND
   break;
 #endif
 
-  skb = dev_alloc_skb(nSize+2); /* +2 for max. aligment below */
+  skb = dev_alloc_skb(cb->databuffer.length + 2); /* +2 for max. aligment below */
   if (skb == NULL) {
     printk("%s: Cannot allocate a sk_buff of size %d\n",
-	   cb->name, nSize+2);
+           cb->name, cb->databuffer.length + 2);
     cb->stats.rx_dropped++;
     return;
   }
@@ -5537,32 +5751,19 @@ void handle_mdind(WL24Cb_t *cb, Card_Word_t msgbuf)
      has 6+6+2+3=17 byte header before IP start (all other have
      6+6+2 bytes), but Ether802_3 is no IP, but a Novell Frame Type */
 
-  cb->stats.rx_bytes += nSize;
+  cb->stats.rx_bytes += cb->databuffer.length;
   cb->stats.rx_packets++;
   cb->netdev->last_rx = jiffies;
 
-  /* copy dest and source MAC addresses from the "ind" struct */
-  memcpy( skb_put(skb,sizeof(ind.DAddr)+sizeof(ind.SAddr)), ind.DAddr,
-	  sizeof(ind.DAddr)+sizeof(ind.SAddr));
-  nSize -= (sizeof(ind.DAddr)+sizeof(ind.SAddr));
+  /* copy resulting buffer to SKB */
 
-  if (insertLen) {
-    /* put the length in network byte order */ 
-    uint8 *ptr = skb_put(skb,2);
-    nSize -= 2;
-    *ptr++ = nSize>>8 & 0xff;
-    *ptr++ = nSize & 0xff;
-  }
+  wl24drain(&cb->databuffer, skb_put(skb, cb->databuffer.length));
 
 #ifdef LOG_STATE_IBSS_MDIND
   printk(KERN_DEBUG "%s %s: skb->data: ", cb->name, __FUNCTION__);
   dumpk(skb->data, 12);
   printk("\n");
 #endif      
-
-  assert(nSize > 0);
-
-  read_rxbuf(cb, skb_put(skb,nSize), nSize, ind.Data, sizeof(RxHeader_t)+nSkip);
 
   /* Notify the upper protocol layers that there is another packet */
   /* to handle. netif_rx() always succeeds. see dev.c for more.    */
@@ -5591,7 +5792,7 @@ void state_starting_ibss(WL24Cb_t *cb, uint8 sigid, Card_Word_t msgbuf)
           printk(KERN_DEBUG "%s: started own IBSS on channel %d\n",
                  cb->name, cb->Channel);
         newstate(cb, state_started_ibss);
-	netif_carrier_on(cb->netdev); /* we got a carrier */
+        netif_carrier_on(cb->netdev); /* we got a carrier */
         netif_wake_queue(cb->netdev);
       } else {
         int i;
@@ -5673,7 +5874,7 @@ void state_joined_ess(WL24Cb_t *cb, uint8 sigid, Card_Word_t msgbuf)
 {
 
   assert(cb->bsstype == BSSType_Infrastructure ||
-	 cb->bsstype == BSSType_AnyBSS);
+         cb->bsstype == BSSType_AnyBSS);
 
   switch(sigid) {
 
@@ -5688,9 +5889,9 @@ void state_joined_ess(WL24Cb_t *cb, uint8 sigid, Card_Word_t msgbuf)
     /* original sw on DeauthInd / DisassocInd / Alarm:
        - send ResyncReq
        - on rx of ResyncCfm (either successful or unsuccessful)
-         try to join a BSS from list, starting with the 
-         current one (!) 
-    What does ResyncReq trigger ??? */
+       try to join a BSS from list, starting with the 
+       current one (!) 
+       What does ResyncReq trigger ??? */
 
   case DeauthIndicate_ID:
     {
@@ -5710,7 +5911,7 @@ void state_joined_ess(WL24Cb_t *cb, uint8 sigid, Card_Word_t msgbuf)
       if (!memcmp(ind.MacAddress,cb->BSSset[cb->currBSS].BSSID,
                   sizeof(cb->BSSset[cb->currBSS].BSSID))) {
         /* stop net if */
-	netif_carrier_off(cb->netdev); /* we have no carrier anymore */
+        netif_carrier_off(cb->netdev); /* we have no carrier anymore */
         netif_stop_queue(cb->netdev);
         /* look for next bss */
         try_join_next_bss(cb, FALSE);
@@ -5740,13 +5941,13 @@ void state_joined_ess(WL24Cb_t *cb, uint8 sigid, Card_Word_t msgbuf)
       if (!memcmp(ind.MacAddress,cb->BSSset[cb->currBSS].BSSID,
                   sizeof(cb->BSSset[cb->currBSS].BSSID))) {
         /* stop net if */
-	netif_carrier_off(cb->netdev); /* we have no carrier anymore */
+        netif_carrier_off(cb->netdev); /* we have no carrier anymore */
         netif_stop_queue(cb->netdev);
         /* TODO: try to assoc with another already authenticated-to
            BSS - something like:
 
            if (!try_assoc_to_next_auth_bss(cb))
-            try_join_next_bss(cb, FALSE); */
+           try_join_next_bss(cb, FALSE); */
 
         /* look for next bss */
         try_join_next_bss(cb, FALSE);
@@ -5763,8 +5964,8 @@ void state_joined_ess(WL24Cb_t *cb, uint8 sigid, Card_Word_t msgbuf)
     try_join_next_bss(cb, FALSE); /* try to join next matching BSS */
     break;
 
-  /* TODO: When do we send DeassocReq / DeauthReq ourselves, i.e.
-     implement roaming in the ESS ... */
+    /* TODO: When do we send DeassocReq / DeauthReq ourselves, i.e.
+       implement roaming in the ESS ... */
 
   default:
     printk(KERN_WARNING "%s: state JOINED_ESS: got unexpected signal %d\n",
@@ -5786,8 +5987,8 @@ int proc_read_param(char *buf, char **start, off_t offset, int count,
 #define CHECK_ENDE if ((p-buf) > (count - 80)) goto proc_read_param_ende
 
   p += sprintf(p,
-	       "LLCType:     %s (%d)\n"
-	       "networktype: %s (%d)\n",
+               "LLCType:     %s (%d)\n"
+               "networktype: %s (%d)\n",
                cb->llctype == LLCType_WaveLan ? "LLCType_WaveLan" :
                "LLCType_IEEE_802_11", cb->llctype,
                cb->bsstype == BSSType_Infrastructure ? "BSSType_Infrastructure" : 
@@ -5796,8 +5997,8 @@ int proc_read_param(char *buf, char **start, off_t offset, int count,
   CHECK_ENDE;
 
   p += sprintf(p,
-	       "Channel:     %d\n"
-	       "networkname: \"%s\" (", cb->Channel, cb->ESSID+2);
+               "Channel:     %d\n"
+               "networkname: \"%s\" (", cb->Channel, cb->ESSID+2);
   CHECK_ENDE;
 
   for(i=0; i < cb->ESSID[1] + 2; i++) {
@@ -5807,7 +6008,7 @@ int proc_read_param(char *buf, char **start, off_t offset, int count,
   p += sprintf(p,")\n");
 
   p += sprintf(p,
-	       "state:       %s\n",state2str(cb->state,obuf));
+               "state:       %s\n",state2str(cb->state,obuf));
 
  proc_read_param_ende:
   *eof = 1;
@@ -5817,7 +6018,7 @@ int proc_read_param(char *buf, char **start, off_t offset, int count,
 
 /* == PROC proc_read_hardware == */
 int proc_read_hardware(char *buf, char **start, off_t offset, int count, 
-                    int *eof, void *data)
+                       int *eof, void *data)
 {
   WL24Cb_t *cb = data;
   char *p = buf;
@@ -5825,21 +6026,21 @@ int proc_read_hardware(char *buf, char **start, off_t offset, int count,
 #define CHECK_ENDE if ((p-buf) > (count - 80)) goto proc_read_hw_ende
 
   p += sprintf(p,
-	       "card name:   %s\n"
-	       "fw date:     %s\n"
-	       "fw version:  %x.%x\n",
-	       cb->CardName, cb->FirmwareDate, cb->FWversion[0], cb->FWversion[1]);
+               "card name:   %s\n"
+               "fw date:     %s\n"
+               "fw version:  %x.%x\n",
+               cb->CardName, cb->FirmwareDate, cb->FWversion[0], cb->FWversion[1]);
 
   CHECK_ENDE;
 
   p += sprintf(p,
-	       "MAC addr:    %02X:%02X:%02X:%02X:%02X:%02X\n"
-	       "freq domain: x%x\n",
-	       cb->MacAddress[0],cb->MacAddress[1],cb->MacAddress[2],
-	       cb->MacAddress[3],cb->MacAddress[4],cb->MacAddress[5], 
-	       cb->FreqDomain);
+               "MAC addr:    %02X:%02X:%02X:%02X:%02X:%02X\n"
+               "freq domain: x%x\n",
+               cb->MacAddress[0],cb->MacAddress[1],cb->MacAddress[2],
+               cb->MacAddress[3],cb->MacAddress[4],cb->MacAddress[5], 
+               cb->FreqDomain);
 
-proc_read_hw_ende:
+ proc_read_hw_ende:
   *eof = 1;
   return p - buf;
 #undef CHECK_ENDE
@@ -5859,7 +6060,7 @@ int proc_read_trace(char *buf, char **start, off_t offset, int count,
 
 #if 0
   printk(KERN_DEBUG "%s %s: offset %lu, cb->trace_nr %d\n", 
-	 cb->name, __FUNCTION__, offset, cb->trace_nr);
+         cb->name, __FUNCTION__, offset, cb->trace_nr);
 #endif
 
   if (offset == 0) {
@@ -5869,7 +6070,7 @@ int proc_read_trace(char *buf, char **start, off_t offset, int count,
       *eof = 1;
       return 0;
     } else {
-    /* find the oldest record */
+      /* find the oldest record */
       tr = cb->trace_nr >= TRACE_NR_RECS ? cb->trace_next : 0;
     }
   } else {
@@ -5884,45 +6085,45 @@ int proc_read_trace(char *buf, char **start, off_t offset, int count,
   te = &cb->trace[tr];
 
   switch (te->id) {
-      case TRACE_MSG_SENT:
-      case TRACE_MSG_RCV:
-        p += sprintf(p, "%s: %8u %s ",
-                     te->id == TRACE_MSG_SENT ? " SENDMSG": " RCV_MSG",
-                     te->u.first.jiffies, sigid2str(te->u.first.data[0]));
-        for(i=1; i < te->len; i++)
-          p += sprintf(p, "%02x ", te->u.first.data[i]);
-        break;
+  case TRACE_MSG_SENT:
+  case TRACE_MSG_RCV:
+    p += sprintf(p, "%s: %8u %s ",
+                 te->id == TRACE_MSG_SENT ? " SENDMSG": " RCV_MSG",
+                 te->u.first.jiffies, sigid2str(te->u.first.data[0]));
+    for(i=1; i < te->len; i++)
+      p += sprintf(p, "%02x ", te->u.first.data[i]);
+    break;
 
-      case TRACE_NEW_STATE:
-      {
-        char obuf1[12], obuf2[12];
-        p += sprintf(p, "NEWSTATE: %8u %s -> %s", te->u.first.jiffies,
-                     stateid2str(te->u.first.data[0],obuf1),
-                     stateid2str(te->u.first.data[1],obuf2));
-      }
-      break;
+  case TRACE_NEW_STATE:
+    {
+      char obuf1[12], obuf2[12];
+      p += sprintf(p, "NEWSTATE: %8u %s -> %s", te->u.first.jiffies,
+                   stateid2str(te->u.first.data[0],obuf1),
+                   stateid2str(te->u.first.data[1],obuf2));
+    }
+    break;
 
-      case TRACE_NEW_BSS_FOUND:
-        p += sprintf(p, "  NEWBSS: %8u ch %d rssi %d cap x%02x%02x ",
-		     te->u.first.jiffies,
-                     te->u.first.data[0], te->u.first.data[1],
-                     te->u.first.data[2], te->u.first.data[3]);
-        p += sprintf(p, "BSSID %02x:%02x:%02x:%02x:%02x:%02x",
-                     te->u.first.data[4], te->u.first.data[5],
-                     te->u.first.data[6], te->u.first.data[7],
-                     te->u.first.data[8], te->u.first.data[9]);
-        break;
+  case TRACE_NEW_BSS_FOUND:
+    p += sprintf(p, "  NEWBSS: %8u ch %d rssi %d cap x%02x%02x ",
+                 te->u.first.jiffies,
+                 te->u.first.data[0], te->u.first.data[1],
+                 te->u.first.data[2], te->u.first.data[3]);
+    p += sprintf(p, "BSSID %02x:%02x:%02x:%02x:%02x:%02x",
+                 te->u.first.data[4], te->u.first.data[5],
+                 te->u.first.data[6], te->u.first.data[7],
+                 te->u.first.data[8], te->u.first.data[9]);
+    break;
 
-      case TRACE_TRY_NEW_BSS:
-        p += sprintf(p, "  TRYBSS: %8u ch %d rssi %d cap x%02x%02x ",
-		     te->u.first.jiffies,
-                     te->u.first.data[0], te->u.first.data[1],
-                     te->u.first.data[2], te->u.first.data[3]);
-        p += sprintf(p, "BSSID %02x:%02x:%02x:%02x:%02x:%02x",
-                     te->u.first.data[4], te->u.first.data[5],
-                     te->u.first.data[6], te->u.first.data[7],
-                     te->u.first.data[8], te->u.first.data[9]);
-        break;
+  case TRACE_TRY_NEW_BSS:
+    p += sprintf(p, "  TRYBSS: %8u ch %d rssi %d cap x%02x%02x ",
+                 te->u.first.jiffies,
+                 te->u.first.data[0], te->u.first.data[1],
+                 te->u.first.data[2], te->u.first.data[3]);
+    p += sprintf(p, "BSSID %02x:%02x:%02x:%02x:%02x:%02x",
+                 te->u.first.data[4], te->u.first.data[5],
+                 te->u.first.data[6], te->u.first.data[7],
+                 te->u.first.data[8], te->u.first.data[9]);
+    break;
 
   case TRACE_DATA:
     p += sprintf(p, "    DATA:          ");
@@ -5941,7 +6142,7 @@ int proc_read_trace(char *buf, char **start, off_t offset, int count,
 
 #if 0
   printk(KERN_DEBUG "%s %s: dump trace entry %d: |%s| ",
-	 cb->name, __FUNCTION__, tr, buf);
+         cb->name, __FUNCTION__, tr, buf);
   dumpk((uint8 *)te,sizeof(*te));
   printk("\n");
 #endif
@@ -5956,7 +6157,7 @@ int proc_read_trace(char *buf, char **start, off_t offset, int count,
 #if (LINUX_VERSION_CODE < KERNEL_VERSION(2,4,0))
 /* == PROC proc_write_debug == */
 ssize_t proc_write_debug(struct file *fil, const char *inbuf ,
-			 unsigned long len, void *priv)
+                         unsigned long len, void *priv)
 {
   char buf[128]; /* max 18 char in input */
   WL24Cb_t *cb = priv;
@@ -6002,7 +6203,7 @@ ssize_t proc_write_debug(struct file *fil, const char *inbuf ,
 
 /* == PROC proc_read_debug == */
 int proc_read_debug(char *buf, char **start, off_t offset,
-                        int length, int *eof, void *data)
+                    int length, int *eof, void *data)
 {
   WL24Cb_t *cb = data;
 
@@ -6011,19 +6212,19 @@ int proc_read_debug(char *buf, char **start, off_t offset,
   else {
     *eof = 1;
     return sprintf(buf,
-		   "dbg_mask:          %08x\n"
-		   "msg_from_dbg_mask: %08x\n"
-		   "msg_to_dbg_mask:   %08x\n"
-		   "trace_mask:        %08x "
+                   "dbg_mask:          %08x\n"
+                   "msg_from_dbg_mask: %08x\n"
+                   "msg_to_dbg_mask:   %08x\n"
+                   "trace_mask:        %08x "
 #if TRACE_NR_RECS > 0
-		   "(ENABLED)"
+                   "(ENABLED)"
 #else
-		   "(DISABLED)"
+                   "(DISABLED)"
 #endif
-		   "\n",
-		   cb->dbg_mask, cb->msg_from_dbg_mask,
-		   cb->msg_to_dbg_mask, cb->trace_mask
-		   );
+                   "\n",
+                   cb->dbg_mask, cb->msg_from_dbg_mask,
+                   cb->msg_to_dbg_mask, cb->trace_mask
+                   );
   }
 } /* proc_read_debug */
 
@@ -6032,7 +6233,7 @@ int proc_read_debug(char *buf, char **start, off_t offset,
 
 /* == PROC proc_write_debug == */
 ssize_t proc_write_debug(struct file *fil, const char *inbuf ,
-			 size_t len, loff_t *off)
+                         size_t len, loff_t *off)
 {
   char buf[128]; /* max 18 char in input */
   const struct inode *ino = fil->f_dentry->d_inode;
@@ -6089,19 +6290,19 @@ ssize_t proc_read_debug(struct file *fil, char *buf, size_t sz, loff_t *off)
     return 0;
   else {
     *off = sprintf(buf,
-		   "dbg_mask:          %08x\n"
-		   "msg_from_dbg_mask: %08x\n"
-		   "msg_to_dbg_mask:   %08x\n"
-		   "trace_mask:        %08x "
+                   "dbg_mask:          %08x\n"
+                   "msg_from_dbg_mask: %08x\n"
+                   "msg_to_dbg_mask:   %08x\n"
+                   "trace_mask:        %08x "
 #if TRACE_NR_RECS > 0
-		   "(ENABLED)"
+                   "(ENABLED)"
 #else
-		   "(DISABLED)"
+                   "(DISABLED)"
 #endif
-		   "\n",
-		   cb->dbg_mask, cb->msg_from_dbg_mask,
-		   cb->msg_to_dbg_mask, cb->trace_mask
-		   );
+                   "\n",
+                   cb->dbg_mask, cb->msg_from_dbg_mask,
+                   cb->msg_to_dbg_mask, cb->trace_mask
+                   );
     return *off;
   }
 } /* proc_read_debug */
@@ -6111,7 +6312,7 @@ ssize_t proc_read_debug(struct file *fil, char *buf, size_t sz, loff_t *off)
 
 /* == PROC proc_read_bss_set == */
 int proc_read_bss_set(char *buf, char **start, off_t offset, int count, 
-                    int *eof, void *data)
+                      int *eof, void *data)
 {
   WL24Cb_t *cb = data;
   BSSDesc_t *bss;
@@ -6123,7 +6324,7 @@ int proc_read_bss_set(char *buf, char **start, off_t offset, int count,
 
 #if 0
   printk(KERN_DEBUG "%s: %s: *start %p offset %ld count %d\n", 
-	 cb->name, __FUNCTION__, *start, offset, count);
+         cb->name, __FUNCTION__, *start, offset, count);
 #endif
 
   if (offset == 0) {
@@ -6138,7 +6339,7 @@ int proc_read_bss_set(char *buf, char **start, off_t offset, int count,
 
 #if 0
   printk(KERN_DEBUG "%s: %s: next index %d\n", cb->name, __FUNCTION__, 
-	 cb->proc_read_bss_idx);
+         cb->proc_read_bss_idx);
 #endif
 
   if (cb->proc_read_bss_idx >= NR_BSS_DESCRIPTIONS) {
@@ -6148,7 +6349,7 @@ int proc_read_bss_set(char *buf, char **start, off_t offset, int count,
 
 #if 0
   printk(KERN_DEBUG "%s: %s: printing index %d\n", cb->name, __FUNCTION__, 
-	 cb->proc_read_bss_idx);
+         cb->proc_read_bss_idx);
 #endif
 
   bss = &cb->BSSset[cb->proc_read_bss_idx];
@@ -6157,11 +6358,11 @@ int proc_read_bss_set(char *buf, char **start, off_t offset, int count,
     p += sprintf(p, "current BSS\n");
 
   p += sprintf(p,
-	       "BSSID:           %02X:%02X:%02X:%02X:%02X:%02X\n"
-	       "SSID:            %s (",
-	       bss->BSSID[0],bss->BSSID[1],bss->BSSID[2],
-	       bss->BSSID[3],bss->BSSID[4],bss->BSSID[5],
-	       bss->SSID+2);
+               "BSSID:           %02X:%02X:%02X:%02X:%02X:%02X\n"
+               "SSID:            %s (",
+               bss->BSSID[0],bss->BSSID[1],bss->BSSID[2],
+               bss->BSSID[3],bss->BSSID[4],bss->BSSID[5],
+               bss->SSID+2);
   CHECK_ENDE;
 
   for(i=0; i < bss->SSID[1] + 2; i++) {
@@ -6173,77 +6374,77 @@ int proc_read_bss_set(char *buf, char **start, off_t offset, int count,
   p += sprintf(p,")\n");
 
   p += sprintf(p,
-	       "BSSType:         x%x\n",bss->BSSType);
+               "BSSType:         x%x\n",bss->BSSType);
 
   CHECK_ENDE;
 
   p += sprintf(p,
-	       "CapabilityInfo:  x%04x %s%s%s%s%s\n"
-	       "Channel:         %d\n",
-	       bss->CapabilityInfo,
-	       bss->CapabilityInfo & CAP_ESS ? "ESS," : "",
-	       bss->CapabilityInfo & CAP_IBSS ? "IBSS," : "",
-	       bss->CapabilityInfo & CAP_CF_POLLABLE ? "CF_POLLABLE," : "",
-	       bss->CapabilityInfo & CAP_CF_POLL_REQ ? "CF_POLL_REQ," : "",
-	       bss->CapabilityInfo & CAP_PRIVACY ? "PRIVACY," : "",
-	       bss->PHYpset[2]);
+               "CapabilityInfo:  x%04x %s%s%s%s%s\n"
+               "Channel:         %d\n",
+               bss->CapabilityInfo,
+               bss->CapabilityInfo & CAP_ESS ? "ESS," : "",
+               bss->CapabilityInfo & CAP_IBSS ? "IBSS," : "",
+               bss->CapabilityInfo & CAP_CF_POLLABLE ? "CF_POLLABLE," : "",
+               bss->CapabilityInfo & CAP_CF_POLL_REQ ? "CF_POLL_REQ," : "",
+               bss->CapabilityInfo & CAP_PRIVACY ? "PRIVACY," : "",
+               bss->PHYpset[2]);
 
   CHECK_ENDE;
 
   p += sprintf(p,
-	       "BeaconPeriod:    x%x\n"
-	       "DTIMPeriod:      x%x\n"
-	       "Timestamp:       x%02x%02x%02x%02x%02x%02x%02x%02x\n"
-	       "LocalTime:       x%02x%02x%02x%02x%02x%02x%02x%02x\n",
-	       bss->BeaconPeriod,
-	       bss->DTIMPeriod,
-	       bss->Timestamp[0],bss->Timestamp[1],bss->Timestamp[2],bss->Timestamp[3],
-	       bss->Timestamp[4],bss->Timestamp[5],bss->Timestamp[6],bss->Timestamp[7],
-	       bss->LocalTime[0],bss->LocalTime[1],bss->LocalTime[2],bss->LocalTime[3],
-	       bss->LocalTime[4],bss->LocalTime[5],bss->LocalTime[6],bss->LocalTime[7]);
+               "BeaconPeriod:    x%x\n"
+               "DTIMPeriod:      x%x\n"
+               "Timestamp:       x%02x%02x%02x%02x%02x%02x%02x%02x\n"
+               "LocalTime:       x%02x%02x%02x%02x%02x%02x%02x%02x\n",
+               bss->BeaconPeriod,
+               bss->DTIMPeriod,
+               bss->Timestamp[0],bss->Timestamp[1],bss->Timestamp[2],bss->Timestamp[3],
+               bss->Timestamp[4],bss->Timestamp[5],bss->Timestamp[6],bss->Timestamp[7],
+               bss->LocalTime[0],bss->LocalTime[1],bss->LocalTime[2],bss->LocalTime[3],
+               bss->LocalTime[4],bss->LocalTime[5],bss->LocalTime[6],bss->LocalTime[7]);
 
   CHECK_ENDE;
 
   p += sprintf(p,
-	       "PHYpset:         x%02x%02x%02x\n",
-	       bss->PHYpset[0],bss->PHYpset[1],bss->PHYpset[2]);
+               "PHYpset:         x%02x%02x%02x\n",
+               bss->PHYpset[0],bss->PHYpset[1],bss->PHYpset[2]);
 
   CHECK_ENDE;
 
   p += sprintf(p,
-	       "CFpset:          x%02x%02x%02x%02x%02x%02x%02x%02x\n",
-	       bss->CFpset[0],bss->CFpset[1],bss->CFpset[2],bss->CFpset[3],
-	       bss->CFpset[4],bss->CFpset[5],bss->CFpset[6],bss->CFpset[7]);
+               "CFpset:          x%02x%02x%02x%02x%02x%02x%02x%02x\n",
+               bss->CFpset[0],bss->CFpset[1],bss->CFpset[2],bss->CFpset[3],
+               bss->CFpset[4],bss->CFpset[5],bss->CFpset[6],bss->CFpset[7]);
 
   CHECK_ENDE;
 
   p += sprintf(p,
-	       "IBSSpset:        x%02x%02x%02x%02x\n",
-	       bss->IBSSpset[0],bss->IBSSpset[1],bss->IBSSpset[2],bss->IBSSpset[3]
-	       );
+               "IBSSpset:        x%02x%02x%02x%02x\n",
+               bss->IBSSpset[0],bss->IBSSpset[1],bss->IBSSpset[2],bss->IBSSpset[3]
+               );
 
   CHECK_ENDE;
 
   p += sprintf(p,
-	       "BSSBasicRateSet: %s x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x\n"
-	       "RSSI(last Scan): x%02x\n"
-	       "RSSI(last data): x%02x\n\n",
-	       rateset2str(bss->BSSBasicRateSet,obuf, sizeof(obuf)),
-	       bss->BSSBasicRateSet[0],bss->BSSBasicRateSet[1],bss->BSSBasicRateSet[2],
-	       bss->BSSBasicRateSet[3],bss->BSSBasicRateSet[4],bss->BSSBasicRateSet[5],
-	       bss->BSSBasicRateSet[6],bss->BSSBasicRateSet[7],bss->BSSBasicRateSet[8],
-	       bss->BSSBasicRateSet[9],
-	       bss->ScanRSSI, bss->MdIndRSSI);
+               "BSSBasicRateSet: %s x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x\n"
+               "RSSI(last Scan): x%02x\n"
+               "RSSI(last data): x%02x\n\n",
+               rateset2str(bss->BSSBasicRateSet,obuf, sizeof(obuf)),
+               bss->BSSBasicRateSet[0],bss->BSSBasicRateSet[1],bss->BSSBasicRateSet[2],
+               bss->BSSBasicRateSet[3],bss->BSSBasicRateSet[4],bss->BSSBasicRateSet[5],
+               bss->BSSBasicRateSet[6],bss->BSSBasicRateSet[7],bss->BSSBasicRateSet[8],
+               bss->BSSBasicRateSet[9],
+               bss->ScanRSSI, bss->MdIndRSSI);
 
 	       
-proc_read_bss_set_ende:
+ proc_read_bss_set_ende:
   *eof = 0;
 
   *start = buf;
 
 #if 0
   printk(KERN_DEBUG "%s: %s: returning %d\n",
-	 cb->name, __FUNCTION__, p - buf);
+         cb->name, __FUNCTION__, p - buf);
 #endif
 
   cb->proc_read_bss_idx++;
@@ -6284,7 +6485,7 @@ void wl24n_create_procdir(void)
 
 #if 0
   printk(KERN_DEBUG "%s: created dir " PROC_SUB_DIR " in /proc/driver\n",
-	 __FUNCTION__);
+         __FUNCTION__);
 #endif
 
 } /* wl24n_create_procdir */
@@ -6318,7 +6519,7 @@ void create_proc_entries(WL24Cb_t *cb)
 
 #if 0
   printk(KERN_DEBUG "%s %s: creating dir %s in /proc/driver/" PROC_SUB_DIR "/\n",
-	 cb->name, __FUNCTION__, dir_str);
+         cb->name, __FUNCTION__, dir_str);
 #endif
 
   if ((cb->pdir=proc_mkdir(dir_str, proc_subdir)) == NULL) {
@@ -6379,7 +6580,7 @@ void delete_proc_entries(WL24Cb_t *cb)
 
 /* TODO:
 
-- Readme überarbeiten
-- Testcode entfernen (restart_card,
+   - Readme überarbeiten
+   - Testcode entfernen (restart_card,
 
- */
+*/

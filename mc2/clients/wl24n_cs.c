@@ -1,7 +1,8 @@
-/* $Id: wl24n_cs.c,v 1.1 2002/10/28 21:09:33 jal2 Exp $ */
+/* $Id: wl24n_cs.c,v 1.2 2002/11/04 21:23:56 jal2 Exp $ */
 
 /* ===========================================================    
     Copyright (C) 2002 Joerg Albert - joerg.albert@gmx.de
+    Copyright (C) 2002 Alfred Arnold alfred@ccac.rwth-aachen.de
 
     Portions of the source code are based on code by
     David A. Hinds under Copyright (C) 1999 David A. Hinds
@@ -69,9 +70,10 @@
 
 #define INT_MODULE_PARM(n, v) static int n = v; MODULE_PARM(n, "i")
 
-MODULE_AUTHOR("Joerg Albert <joerg.albert@gmx.de>");
+MODULE_AUTHOR("Alfred Arnold alfred@ccac.rwth-aachen.de\n"
+              "Joerg Albert <joerg.albert@gmx.de>\nHeiko Kirschke\n");
 MODULE_DESCRIPTION("ELSA Airlancer MC-2 WLAN PCMCIA driver");
-MODULE_LICENSE("Dual MPL/GPL");
+MODULE_LICENSE("GPL");
 /* Newer, simpler way of listing specific interrupts */
 static int irq_list[4] = { -1 };
 MODULE_PARM(irq_list, "1-4i");
@@ -113,10 +115,13 @@ INT_MODULE_PARM(networktype, BSSType_Independent);
 MODULE_PARM_DESC(networktype,
                  "type of BSS to connect to: access point (0), ad-hoc (1) or both (2)");
 
-static char networkname[IW_ESSID_MAX_SIZE+1] = "\0";
-MODULE_PARM(networkname, "c" __MODULE_STRING(IW_ESSID_MAX_SIZE));
+static char networkname[2*IW_ESSID_MAX_SIZE+1] = "\0";
+MODULE_PARM(networkname, "c" __MODULE_STRING(64));
 MODULE_PARM_DESC(networkname,
                  "ID of ESS (or IBSS) to connect to (empty string matches all)");
+
+INT_MODULE_PARM(nwn_is_hex, 0);
+MODULE_PARM_DESC(nwn_is_nex, "is networkname given as a sequence of hex digits ?");
 
 INT_MODULE_PARM(Channel, 4);
 MODULE_PARM_DESC(Channel,
@@ -136,7 +141,7 @@ INT_MODULE_PARM(pc_debug, PCMCIA_DEBUG);
 #define DEBUG(n, args...) if (pc_debug>(n)) printk(KERN_DEBUG args)
 /* VERSION is passed from the Makefile in a define as a string ! */
 static char *version __attribute__((unused)) =
-  __FILE__ " v" WL24_VERSION " $Id: wl24n_cs.c,v 1.1 2002/10/28 21:09:33 jal2 Exp $";
+  __FILE__ " v" WL24_VERSION " $Id: wl24n_cs.c,v 1.2 2002/11/04 21:23:56 jal2 Exp $";
 #else
 #define DEBUG(n, args...)
 #endif
@@ -218,6 +223,36 @@ typedef struct local_info_t {
   struct bus_operations *bus;
   void *mc2_priv; /* we got this from wl24_card_init() */
 } local_info_t;
+
+
+int hex2bin(unsigned char *ib, unsigned char *ob)
+		 /* convert a \0 terminated string of hex digits into the binary repr.
+				and returns the number of bytes created.
+				ib and ob may be the same buffer ! */
+{
+	int i=0;
+	unsigned char val = 0;
+#define HEX2BIN(x) \
+ ((x) <= '9' ? (x)-'0' :\
+  (x) >= 'a' && (x) <= 'f' ? (x)-'a'+10 : (x)-'A'-10)
+
+	while (*ib) {
+		if (i%2)
+			*ob++ = (val<<4) | HEX2BIN(*ib);
+		else
+			val = HEX2BIN(*ib);
+		i++;
+		ib++;
+	}
+
+	if (i%2) {
+		/* we got an odd number of hexdigits - quietly assume a trailing 0 */
+		*ob = val<<4;
+		i++;
+	}
+
+	return i/2;
+}
 
 /*====================================================================*/
 
@@ -433,6 +468,8 @@ static void mc2_config(dev_link_t *link)
   memreq_t map;
   cistpl_cftable_entry_t dflt = { 0 };
   char *dev_name = NULL; /* get the device name from wl24n_card_init() */
+	int nw_len; /* length of networkname */
+
 
   DEBUG(0, "mc2_config(0x%p)\n", link);
 
@@ -565,12 +602,18 @@ static void mc2_config(dev_link_t *link)
      call it before. On the other hand the RequestIRQ returns the
      correct AssignedIRQ to us ... */
   link->open = 0;
+	if (nwn_is_hex) 
+		/* condense the hex string into a binary one */
+		nw_len = hex2bin(networkname,networkname);
+	else
+		nw_len = strlen(networkname);
+
   if ((dev->mc2_priv=wl24n_card_init(dbg_mask, msg_to_dbg_mask,
                                      msg_from_dbg_mask,
                                      link->io.BasePort1,
                                      0, /* was: link->irq.AssignedIRQ */
                                      LLCType, networktype, networkname,
-                                     Channel, &link->open, 
+																		 nw_len, Channel, &link->open, 
                                      &dev_name, trace_mask)) == NULL) {
     printk(KERN_DEBUG "wl24_card_init failed\n");
     mc2_release((u_long)link);
@@ -636,7 +679,7 @@ static void mc2_config(dev_link_t *link)
 
   /* Finally, report what we've done */
   printk(KERN_INFO "%s: %s, version " WL24_VERSION 
-	 ", $Id: wl24n_cs.c,v 1.1 2002/10/28 21:09:33 jal2 Exp $, compiled "
+	 ", $Id: wl24n_cs.c,v 1.2 2002/11/04 21:23:56 jal2 Exp $, compiled "
 	 __DATE__ " " __TIME__ "\n", 
 	 dev->node.dev_name, __FILE__);
   printk(KERN_INFO "%s: index 0x%02x: Vcc %d.%d",
