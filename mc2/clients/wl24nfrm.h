@@ -1,4 +1,4 @@
-/* $Id: wl24nfrm.h,v 1.1 2002/11/04 21:25:28 jal2 Exp $ */
+/* $Id: wl24nfrm.h,v 1.2 2002/12/07 18:51:26 jal2 Exp $ */
 
 /* ===========================================================    
     Copyright (C) 2002 Alfred Arnold alfred@ccac.rwth-aachen.de
@@ -39,7 +39,12 @@ typedef struct _databuffer_t
   char buffer[2400];
 } databuffer_t;
 
-#define WEPBIT 0x40
+/* FrameControl bits, the 16 bit value is stored in LE order ! */
+
+/* offset +1 */
+#define WEPBIT        0x40 
+#define MOREFRAGBIT   0x04
+#define RETRYBIT      0x08
 
 extern void wl24fill(databuffer_t *pbuffer, char *psrc, int length, int offset);
 

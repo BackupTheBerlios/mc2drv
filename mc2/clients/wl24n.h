@@ -1,4 +1,4 @@
-/* $Id: wl24n.h,v 1.2 2002/11/04 21:23:56 jal2 Exp $ */
+/* $Id: wl24n.h,v 1.3 2002/12/07 18:51:26 jal2 Exp $ */
 
 /* ===========================================================    
     Copyright (C) 2002 Joerg Albert - joerg.albert@gmx.de
@@ -127,6 +127,7 @@ typedef enum {
 #define DBG_SAVE_CFM        0x00800000
 #define DBG_RFTEST_CFM      0x01000000
 #define DBG_FAILED_MDCFM    0x02000000
+#define DBG_RX_FRAGMENTS    0x04000000 /* debug fragment re-assembly on rx */
 
 /* trace support */
 

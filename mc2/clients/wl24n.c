@@ -1,4 +1,4 @@
-/* $Id: wl24n.c,v 1.5 2002/11/26 23:01:16 jal2 Exp $ */
+/* $Id: wl24n.c,v 1.6 2002/12/07 18:51:26 jal2 Exp $ */
 /* ===========================================================    
    Copyright (C) 2002 Joerg Albert - joerg.albert@gmx.de
    Copyright (C) 2002 Alfred Arnold alfred@ccac.rwth-aachen.de
@@ -116,6 +116,7 @@ static inline void init_waitqueue_head(wait_queue_head_t *hd)
 //#define LOG_FREQDOMAIN
 //#define LOG_IWENCODE  /* log info on SIOC[GS]IWENCODE ioctl's */
 //#define LOG_IWSPY
+#define LOG_RX_FRAGMENTS /* log info on rx fragments */
 #endif //#ifdef INTERNAL_LOG
 
 /* we need <= 32 zeros to pass a dummy bssid and compare the SSID to it */
@@ -446,7 +447,7 @@ typedef struct {
 /* if the peer vanishes during a connection, we'll get MdConfirm with Status == 2 
    We implement kind of leaky bucket algorithm to determine when we re-scan for a better
    BSS. */
-#define MDCFM_RESCAN_THRE   6 /* threshold when we will start rescan */
+#define MDCFM_RESCAN_THRE   16 /* threshold when we will start rescan */
 #define MDCFM_FAIL_PENALTY  1 /* penalty for each MdCfm failure */
 #define MDCFM_OK_VALUE      2 /*  subtract this for a good MdCfm */
    
@@ -465,6 +466,17 @@ typedef enum {
   Status_Many_Requests = 4,
   Status_AlreadyBSS = 5,
 } Status_t;
+
+/* status values in MdCfm */
+typedef enum {
+  StatusMdCfm_Success = 0,
+  StatusMdCfm_NoBSS   = 1,
+  StatusMdCfm_Fail    = 2,
+  StatusMdCfm_AtimAck = 3,
+  StatusMdCfm_AtimNak = 4,
+  StatusMdCfm_Partial = 5,
+} StatusMdCfm_t;
+
 
 typedef struct {
   uint16  NextBlock;
@@ -522,6 +534,19 @@ typedef struct {
   uint8 updated;   /* updated since last read out */
 } Wlspy_t;
 
+#define MAX_RXDATA_SIZE 2600
+#define NR_RX_FRAG_CACHES 3 /* how many of these caches have we got 
+                               (minimum 3 acc. to standard) */
+typedef struct {
+  uint8 addr2[ETH_ALEN];
+  uint8 frag_nr;
+  uint8 in_use; /* set to 0 if entry is empty */
+  uint16 seq_nr; /* sequence and fragment nr from the sequence control field */
+  uint16 buf_len; /* how many bytes are filled in buf */
+  uint32 last_update; /* jiffies when buf was updated for the last time */
+  uint8 buf[MAX_RXDATA_SIZE]; /* data buffer, will start with net data, no header */
+} RxFragCache_t;
+
 typedef struct _wl24cb_t {
   struct net_device *netdev;
   struct net_device_stats stats;
@@ -529,7 +554,7 @@ typedef struct _wl24cb_t {
   int *open_counter; /* points to link->open from pcmcia, which counts
                         the number of succ. open's (minus the close's) */
 #ifdef WIRELESS_EXT
-	struct iw_statistics	wstats;		// wireless stats
+  struct iw_statistics  wstats;   // wireless stats
 #endif /* WIRELESS_EXT */
   
   wait_queue_head_t waitq; /* to delay processes on ioctl calls */
@@ -624,6 +649,9 @@ typedef struct _wl24cb_t {
   int iwspy_number; /* number of valid entries in iwspy[] below */
   Wlspy_t  iwspy[IW_MAX_SPY];
 #endif
+
+  /* the cache of received rx fragments */
+  RxFragCache_t rx_cache[NR_RX_FRAG_CACHES];
 
   Wlwepstate_t wepstate;
   databuffer_t databuffer;
@@ -1515,13 +1543,13 @@ int restart_card(WL24Cb_t *cb)
     if (cTmp == 'W') {
       /* firmware has completed all tests successfully */
 
-			read_flash_params(cb); // MAC addr, fw version, freq domain
+      read_flash_params(cb); // MAC addr, fw version, freq domain
 
-			/* is the transparent mode available ? */
-			cb->cardmode = ((cb->FWversion[0] == 2) && (cb->FWversion[1] >= 6)) ? 'H' : 'A';
+      /* is the transparent mode available ? */
+      cb->cardmode = ((cb->FWversion[0] == 2) && (cb->FWversion[1] >= 6)) ? 'H' : 'A';
 
       printk(KERN_DEBUG "%s:using card mode %c (%d)\n", cb->name,
-						 cb->cardmode, cb->cardmode);
+             cb->cardmode, cb->cardmode);
       cTmp = cb->cardmode; /* 'A' resp. 'H' */
       copy_to_card(WL_SELFTEST_ADDR, &cTmp, 1, cb); 
       break;
@@ -1534,9 +1562,9 @@ int restart_card(WL24Cb_t *cb)
     return FALSE;
   }
 
-	init_esbq_txbuf(cb); /* get the ESBQ / FreeTxBuf pointers */
-	init_scanlist(cb); /* init. cb-> vars for initial scan */
-			
+  init_esbq_txbuf(cb); /* get the ESBQ / FreeTxBuf pointers */
+  init_scanlist(cb); /* init. cb-> vars for initial scan */
+      
   /* copy the MAC address into the net_device struct */
   memcpy(cb->netdev->dev_addr,cb->MacAddress,sizeof(cb->netdev->dev_addr));
 
@@ -1552,6 +1580,14 @@ int restart_card(WL24Cb_t *cb)
            cb->FWversion[0],cb->FWversion[1],
            cb->FirmwareDate);
   }
+
+  /* init some state info */
+
+  cb->mdcfm_failure = 0; /* the failure counter */
+
+  /* invalidate rx fragment cache */
+  for(i=0; i < NR_RX_FRAG_CACHES; i++)
+    cb->rx_cache[i].in_use = 0;
 
   /* init. state machine and send first request to firmware */
   newstate(cb,state_scanning);
@@ -2405,7 +2441,7 @@ struct net_device_stats *wl24n_get_stats (struct net_device *dev)
     printk(KERN_DEBUG "%s: wl24n_get_stats\n",cb->name);
 #endif
 
-	return &cb->stats;
+  return &cb->stats;
 }
 
 #ifdef WIRELESS_EXT
@@ -2417,7 +2453,7 @@ struct iw_statistics *wl24n_get_wireless_stats (struct net_device *dev)
   if (cb->dbg_mask & DBG_DEV_CALLS)
     printk(KERN_DEBUG "%s: wl24n_get_wireless_stats\n",cb->name);
 
-	return &cb->wstats;
+  return &cb->wstats;
 }
 #endif
 
@@ -2600,42 +2636,42 @@ static int mc2_ioctl_setspy(WL24Cb_t *cb, struct iw_point *srq)
 /* == PROC mc2_ioctl_getspy == */
 static int mc2_ioctl_getspy(WL24Cb_t *cb, struct iw_point *srq)
 {
-	struct sockaddr address[IW_MAX_SPY];
-	struct iw_quality spy_stat[IW_MAX_SPY];
-	int number;
-	int i;
+  struct sockaddr address[IW_MAX_SPY];
+  struct iw_quality spy_stat[IW_MAX_SPY];
+  int number;
+  int i;
 
-	if (cb->dbg_mask & DBG_DEV_CALLS)
-	  printk(KERN_DEBUG "%s: ioctl(SIOCGIWSPY, number %d)\n", 
+  if (cb->dbg_mask & DBG_DEV_CALLS)
+    printk(KERN_DEBUG "%s: ioctl(SIOCGIWSPY, number %d)\n", 
            cb->name, cb->iwspy_number);
 #ifdef LOG_IWSPY
   printk(KERN_DEBUG "%s: iwspy_number %d\n", cb->name, cb->iwspy_number);
 #endif
-	srq->length = number = cb->iwspy_number;
+  srq->length = number = cb->iwspy_number;
 
-	if ((number > 0) && (srq->pointer)) {
-	  /* Create address struct  and copy stats */
-	  for (i = 0; i < number; i++) {
-	    memcpy(address[i].sa_data, cb->iwspy[i].spy_address,
+  if ((number > 0) && (srq->pointer)) {
+    /* Create address struct  and copy stats */
+    for (i = 0; i < number; i++) {
+      memcpy(address[i].sa_data, cb->iwspy[i].spy_address,
              ETH_ALEN);
-	    address[i].sa_family = AF_UNIX;
-	    /* ELSA MC-2: RSSI is not in dBm, no way to get noise and
-	       link quality ... */
-	    spy_stat[i].level = cb->iwspy[i].spy_level;
-	    spy_stat[i].updated = cb->iwspy[i].updated;
-	    cb->iwspy[i].updated = spy_stat[i].qual = 
-	      spy_stat[i].noise = 0;
-	  }
+      address[i].sa_family = AF_UNIX;
+      /* ELSA MC-2: RSSI is not in dBm, no way to get noise and
+         link quality ... */
+      spy_stat[i].level = cb->iwspy[i].spy_level;
+      spy_stat[i].updated = cb->iwspy[i].updated;
+      cb->iwspy[i].updated = spy_stat[i].qual = 
+        spy_stat[i].noise = 0;
+    }
 
-	  /* Push stuff to user space */
+    /* Push stuff to user space */
     if(copy_to_user(srq->pointer, address,
                     sizeof(struct sockaddr) * number))
       return -EFAULT;
     if(copy_to_user(srq->pointer + (sizeof(struct sockaddr)*number),
                     &spy_stat, sizeof(struct iw_quality) * number))
       return -EFAULT;
-	}
-	return 0;
+  }
+  return 0;
 } /* mc2_ioctl_getspy */
 #endif /* #if IW_MAX_SPY > 0 */
 
@@ -2925,7 +2961,7 @@ int wl24n_ioctl(struct net_device *dev, struct ifreq *rq, int cmd)
         rc = -EINVAL;
       } else {
         Card_Word_t val;
-        fthr &= ~0x1;	// Get an even value
+        fthr &= ~0x1; // Get an even value
         val = cpu_to_le16(fthr);
         rc = hw_setmib(cb, aFragmentationThreshold, &val, sizeof(val));
       }
@@ -3000,15 +3036,15 @@ int wl24n_ioctl(struct net_device *dev, struct ifreq *rq, int cmd)
         break;
       case IW_POWER_ALL_R:
         break;
-      case IW_POWER_ON:	// None = ok
+      case IW_POWER_ON: // None = ok
         break;
-      default:	// Invalid
+      default:  // Invalid
         rc = -EINVAL;
       }
       // not supported 
       if ((wrq->u.power.flags & IW_POWER_PERIOD) ||
           (wrq->u.power.flags & IW_POWER_TIMEOUT))
-        rc = -EINVAL;	// Invalid
+        rc = -EINVAL; // Invalid
     }
 #else
     rc = -EOPNOTSUPP;
@@ -3033,12 +3069,12 @@ int wl24n_ioctl(struct net_device *dev, struct ifreq *rq, int cmd)
       printk(KERN_DEBUG "%s: ioctl SIOCSIWENCODE\n", cb->name);
 
 #ifdef LOG_IWENCODE
-		printk(KERN_DEBUG "%s: old wepstate: encrypt %d txkeyid %d exclude_unencr %d\n",
-					 cb->name, cb->wepstate.encrypt, cb->wepstate.txkeyid,
-					 cb->wepstate.exclude_unencr);
-		printk(KERN_DEBUG "%s: siwencode: enc.flags %08x pointer %p len %d\n",
-					 cb->name, wrq->u.encoding.flags, 
-					 wrq->u.encoding.pointer, wrq->u.encoding.length);
+    printk(KERN_DEBUG "%s: old wepstate: encrypt %d txkeyid %d exclude_unencr %d\n",
+           cb->name, cb->wepstate.encrypt, cb->wepstate.txkeyid,
+           cb->wepstate.exclude_unencr);
+    printk(KERN_DEBUG "%s: siwencode: enc.flags %08x pointer %p len %d\n",
+           cb->name, wrq->u.encoding.flags, 
+           wrq->u.encoding.pointer, wrq->u.encoding.length);
 #endif
 
     if (cb->cardmode != 'H')
@@ -3091,9 +3127,9 @@ int wl24n_ioctl(struct net_device *dev, struct ifreq *rq, int cmd)
     rc = 0;
 
 #ifdef LOG_IWENCODE
-		printk(KERN_DEBUG "%s: new wepstate: encrypt %d txkeyid %d exclude_unencr %d\n",
-					 cb->name, cb->wepstate.encrypt, cb->wepstate.txkeyid,
-					 cb->wepstate.exclude_unencr);
+    printk(KERN_DEBUG "%s: new wepstate: encrypt %d txkeyid %d exclude_unencr %d\n",
+           cb->name, cb->wepstate.encrypt, cb->wepstate.txkeyid,
+           cb->wepstate.exclude_unencr);
 #endif
 
   out:    
@@ -3136,8 +3172,8 @@ int wl24n_ioctl(struct net_device *dev, struct ifreq *rq, int cmd)
       rc = hw_getmib(cb, aTxPowerLevel1+cb->last_mibcfm.MibValue[0]-1);
       if (rc == 0) {
         wrq->u.txpower.value = cb->last_mibcfm.MibValue[0];
-        wrq->u.txpower.fixed = 0;	/* power control possible ??? */
-        wrq->u.txpower.disabled = 0;	/* Can't turn off */
+        wrq->u.txpower.fixed = 0; /* power control possible ??? */
+        wrq->u.txpower.disabled = 0;  /* Can't turn off */
         /* which units has the result ? */
         wrq->u.txpower.flags = IW_TXPOW_MWATT;
       }
@@ -3182,8 +3218,8 @@ int wl24n_ioctl(struct net_device *dev, struct ifreq *rq, int cmd)
 
       // Throughput is no way near 2 Mb/s !
       // This value should be :
-      //	1.6 Mb/s for the 2 Mb/s card
-      //	~5 Mb/s for the 11 Mb/s card
+      //  1.6 Mb/s for the 2 Mb/s card
+      //  ~5 Mb/s for the 11 Mb/s card
       // Jean II
       range.throughput = 1.6 * 1024 * 1024;
       range.min_nwid = 0x0000;
@@ -3195,7 +3231,7 @@ int wl24n_ioctl(struct net_device *dev, struct ifreq *rq, int cmd)
         int k = 0, i;
         for(i=0; i < IW_MAX_FREQUENCIES; i++) {
           if (cb->frdesc->channel_map & (1<<i)) {
-            range.freq[k].i = i+1;	/* Set the list index */
+            range.freq[k].i = i+1;  /* Set the list index */
             range.freq[k].m = frequency_list[i] * 100000;
             range.freq[k++].e = 1; /* frequency_list is in MHz ->
                                     * 10^5 * 10 */
@@ -3225,8 +3261,8 @@ int wl24n_ioctl(struct net_device *dev, struct ifreq *rq, int cmd)
 
 #if WIRELESS_EXT > 9
       /* Power Management */
-      range.min_pmp = 0;		/* ??? */
-      range.max_pmp = 65535000;	/* ??? */
+      range.min_pmp = 0;    /* ??? */
+      range.max_pmp = 65535000; /* ??? */
       range.pmp_flags = 0;
       range.pmt_flags = 0;
       range.pm_capa = 0;
@@ -3702,10 +3738,10 @@ bool  ScanReq(WL24Cb_t *cb, uint16 min_channel_time,
       (cb->msg_to_dbg_mask & DBG_SCAN_REQ)) {
     printk(KERN_DEBUG "%s: ScanReq ScanType %d BSSType %d SSID (%d)%s (",
            cb->name, Req.ScanType, Req.BSSType, Req.SSID[1], 
-					 Req.SSID[1] ? cb->ESSID+2 /*Req.SSID+2 is not \0 term.!*/ : 
+           Req.SSID[1] ? cb->ESSID+2 /*Req.SSID+2 is not \0 term.!*/ : 
            (uint8 *)"");
-		dumpk(Req.SSID+2, Req.SSID[1]);
-		printk(") min/max channel time %d/%d\n",
+    dumpk(Req.SSID+2, Req.SSID[1]);
+    printk(") min/max channel time %d/%d\n",
            min_channel_time, max_channel_time);
   }
 
@@ -3764,13 +3800,13 @@ bool JoinReq(WL24Cb_t *cb, uint16 station)
      (see 10.3.2.2.2 and 10.3.3.1.2 in [1]) */
   memcpy(Req.BSSID,cb->BSSset[station].BSSID,sizeof(Req.BSSID));
 
-	if (memcmp(&cb->BSSset[station].SSID[2], zeros, 
-						 cb->BSSset[station].SSID[1]))
-		/* just copy the BSS's SSID if it is not filled with \0 */
-		memcpy(Req.SSID,cb->BSSset[station].SSID,sizeof(Req.SSID));
-	else
-		/* otherwise take the SSID specified by iwconfig / module parameter */
-		memcpy(Req.SSID,cb->ESSID,sizeof(Req.SSID));
+  if (memcmp(&cb->BSSset[station].SSID[2], zeros, 
+             cb->BSSset[station].SSID[1]))
+    /* just copy the BSS's SSID if it is not filled with \0 */
+    memcpy(Req.SSID,cb->BSSset[station].SSID,sizeof(Req.SSID));
+  else
+    /* otherwise take the SSID specified by iwconfig / module parameter */
+    memcpy(Req.SSID,cb->ESSID,sizeof(Req.SSID));
 
   Req.BSSType = cb->BSSset[station].BSSType;
   Req.BeaconPeriod = cpu_to_le16(cb->BSSset[station].BeaconPeriod);
@@ -3795,18 +3831,18 @@ bool JoinReq(WL24Cb_t *cb, uint16 station)
            Req.BSSID[0],Req.BSSID[1],Req.BSSID[2],
            Req.BSSID[3],Req.BSSID[4],Req.BSSID[5],
            cb->BSSset[station].SSID[1], &cb->BSSset[station].SSID[2]);
-		dumpk(cb->BSSset[station].SSID+2, cb->BSSset[station].SSID[1]);
-		{
-			/* make Req.SSID[2] \0 terminated */
-			char buf[IW_ESSID_MAX_SIZE+1];
-			assert(Req.SSID[1] <= IW_ESSID_MAX_SIZE);
-			memcpy(buf, &Req.SSID[2], Req.SSID[1]);
-			buf[Req.SSID[1]] = '\0';
+    dumpk(cb->BSSset[station].SSID+2, cb->BSSset[station].SSID[1]);
+    {
+      /* make Req.SSID[2] \0 terminated */
+      char buf[IW_ESSID_MAX_SIZE+1];
+      assert(Req.SSID[1] <= IW_ESSID_MAX_SIZE);
+      memcpy(buf, &Req.SSID[2], Req.SSID[1]);
+      buf[Req.SSID[1]] = '\0';
       printk(") joined SSID (%d)%s (",
              Req.SSID[1], buf);
-		}
-		dumpk(Req.SSID+2,Req.SSID[1]);
-		printk(")\n");
+    }
+    dumpk(Req.SSID+2,Req.SSID[1]);
+    printk(")\n");
   }
 
   /* send the request */
@@ -4524,7 +4560,7 @@ void debug_msg_from_card(WL24Cb_t *cb, uint8 sigid, Card_Word_t msgbuf)
                cb->name, rxhead.Service, le16_to_cpu(rxhead.Length),
                le16_to_cpu(rxhead.FrameControl),
                le16_to_cpu(rxhead.Duration));
-	  
+    
         printk(KERN_DEBUG "%s: RxHd Addr1 %02x:%02x:%02x:%02x:%02x:%02x "
                "Addr2 %02x:%02x:%02x:%02x:%02x:%02x\n",
                cb->name,
@@ -5110,7 +5146,7 @@ void state_invalid(WL24Cb_t *cb, uint8 sigid, Card_Word_t msgbuf)
  compares SSID and BSSType and returns new index or -1 if no BSS found */
 /* Obey that the Belkin AP F5D6130 with unchecked "all SSID ANY" checkbox
    broadcasts a SSID of the correct length but filled with \0 - even if it's
-	 probed with the correct SSID ! */
+   probed with the correct SSID ! */
 int find_matching_bss(WL24Cb_t *cb, int first_index)
 {
   int i;
@@ -5168,13 +5204,13 @@ int find_matching_bss(WL24Cb_t *cb, int first_index)
          Make sure that such an entry is never choosen !
          (We leave it in the list for displaying the environment) */
       if (bss->SSID[1] == 0 ||
-					(cb->ESSID[1] != 0 &&
+          (cb->ESSID[1] != 0 &&
            (cb->ESSID[1] != bss->SSID[1] ||
             (memcmp(&cb->ESSID[2],&bss->SSID[2],cb->ESSID[1]) &&
-						 memcmp(&bss->SSID[2],zeros,bss->SSID[1]))))) {
+             memcmp(&bss->SSID[2],zeros,bss->SSID[1]))))) {
 
-				/* skip the entry if
-					 (the BSS' SSID is ANY) OR
+        /* skip the entry if
+           (the BSS' SSID is ANY) OR
            ((we look for an SSID != ANY) AND
            ((the length of our SSID differs from the entry's SSID) OR
            ((both SSID differ) AND (the SSID of the BSS is not filled with \0)))) */
@@ -5183,11 +5219,11 @@ int find_matching_bss(WL24Cb_t *cb, int first_index)
         printk(KERN_DEBUG "%s %s: %d. entry skipped: wanted ESSID (%d)%s ("
                cb->name, __FUNCTION__, i,  cb->ESSID[1],
                cb->ESSID+2);
-				dumpk(cb->ESSID+2,cb->ESSID[1]);
+        dumpk(cb->ESSID+2,cb->ESSID[1]);
         printk(") entry's SSID (%d)%s (", 
           bss->SSID[1], &bss->SSID[2]);
-				dumpk(&bss->SSID[2],bss->SSID[1]);
-				printk(")\n");
+        dumpk(&bss->SSID[2],bss->SSID[1]);
+        printk(")\n");
 #endif
 
         continue;
@@ -5241,8 +5277,8 @@ void add_bss_to_set(WL24Cb_t *cb, ScanCfm_t *cfm)
           printk(")\n");
 #endif
           return;
-				} else 
-					/* (bss->SSID is empty OR cfm->SSID is not empty)
+        } else 
+          /* (bss->SSID is empty OR cfm->SSID is not empty)
              --> overwrite the entry */
           nr = i;
       }
@@ -5416,7 +5452,7 @@ void state_joining(WL24Cb_t *cb, uint8 sigid, Card_Word_t msgbuf)
   case MdConfirm_ID:
     {
       MdConfirm_t cfm;
-	
+  
       copy_from_card(&cfm, msgbuf, sizeof(cfm), COPY_FAST, cb);
       assert(cfm.SignalID == MdConfirm_ID);
 
@@ -5657,11 +5693,14 @@ void handle_mdcfm(WL24Cb_t *cb, Card_Word_t msgbuf, int do_leaky_bucket)
   /* if we had to stop it before, wake it up */
   netif_wake_queue(cb->netdev);
 
-  if (status != Status_Success) {
+  if (status != StatusMdCfm_Success) {
     cb->stats.tx_dropped++;
 
 # ifdef WIRELESS_EXT
-    cb->wstats.discard.misc++;
+    if (status == StatusMdCfm_NoBSS)
+      cb->wstats.miss.beacon++; /* jal: I hope that is the reason of "NoBSS"*/
+    else
+      cb->wstats.discard.misc++;
 # endif
 
     if (do_leaky_bucket) {
@@ -5698,6 +5737,249 @@ void handle_mdcfm(WL24Cb_t *cb, Card_Word_t msgbuf, int do_leaky_bucket)
   }
 } /* handle_mdcfm */
 
+/* == PROC wl24n_check_frags ==
+   check for rx fragments:
+     - if this is the last fragment of a chain, this will copy the whole chain
+       into cb->databuffer and update databuffer.length accordingly, returns 1
+     - if this is not a fragment of a chain, databuffer remains unchanged,
+       returns 1
+     - if this is a fragment and more will follow, the fragment is stored
+       and zero returned
+     - if this is a retry packet we have already received, zero is returned
+*/
+int wl24n_check_frags(WL24Cb_t *cb, databuffer_t *dbuf)
+{
+  /* offsets of address2 and sequence control field in dbuf+offset */
+#define OFFSET_ADDR2 \
+(offsetof(RxHeader_t,Address2)-offsetof(RxHeader_t,FrameControl))
+#define OFFSET_SEQCTL \
+(offsetof(RxHeader_t,Sequence)-offsetof(RxHeader_t,FrameControl))
+#define HDR_LENGTH \
+(2+offsetof(RxHeader_t,Sequence)-offsetof(RxHeader_t,FrameControl))
+
+  int i;
+  uint8 *hdr = dbuf->buffer + dbuf->offset;
+  uint8 *addr2 = hdr + OFFSET_ADDR2; /* address2 field */
+  /* sequence control */
+  int seqctrl = hdr[OFFSET_SEQCTL] | (hdr[OFFSET_SEQCTL+1]<<8);
+  int seq_nr = seqctrl >> 4;
+  int frag_nr = seqctrl & 0xf; 
+  uint16 frmctl_high = hdr[1]; /* frame control field, high byte */
+  RxFragCache_t *cline;
+
+  assert(dbuf->length >= HDR_LENGTH);
+  if (dbuf->length < HDR_LENGTH)
+    return 0; /* no more processing in caller */
+
+  /* look for address 2 */
+  for(i=0, cline = cb->rx_cache; i < NR_RX_FRAG_CACHES; i++, cline++) {
+    if (cline->in_use && !memcmp(cline->addr2, addr2, ETH_ALEN))
+      break;
+  }
+
+  /* shortcut for non-fragmented packets - I hope the fragment number
+     never wraps ! */
+  if (i == NR_RX_FRAG_CACHES && frag_nr == 0 && 
+      (frmctl_high & MOREFRAGBIT) == 0)
+    return 1;
+
+  if (i < NR_RX_FRAG_CACHES) {
+    /* we found an entry for address2 from new data packet in cline */
+
+    if ((cb->dbg_mask & DBG_MSG_FROM_CARD) &&
+        (cb->msg_from_dbg_mask & DBG_RX_FRAGMENTS)) {
+      printk(KERN_DEBUG "%s: rx frag (seqnr x%x fragnr x%x "
+             "frmctl x%xxx len x%x) matched addr2 in cache "
+             "line %d (seqnr x%x fragnr x%x len x%x)\n",
+             cb->name, seq_nr, frag_nr, frmctl_high, dbuf->length,
+             i, cline->seq_nr, cline->frag_nr, cline->buf_len);
+    }
+
+    if (seq_nr == cline->seq_nr) {
+      /* same sequence number */
+      if (frag_nr == (cline->frag_nr+1)) {
+        /* next fragment */
+        if ((dbuf->length-HDR_LENGTH) <=
+            (sizeof(cline->buf)-cline->buf_len)) {
+          /* the new data fit into the buffer in cline */
+          memcpy(cline->buf+cline->buf_len, hdr+HDR_LENGTH,
+                 dbuf->length-HDR_LENGTH);
+          cline->buf_len += (dbuf->length-HDR_LENGTH);
+          cline->frag_nr++;
+          cline->last_update = jiffies;
+
+#ifdef LOG_RX_FRAGMENTS
+          printk(KERN_DEBUG "%s: rx frag (len x%x) added to cline %d\n",
+                 cb->name, dbuf->length, i);
+#endif
+          if (frmctl_high & MOREFRAGBIT) {
+            /* some fragments follow */
+            return 0; /* consumed data here */
+          } else {
+            /* this was the last fragment */
+            /* we re-use the header in dbuf->buffer+dbuf->offset
+               and attach the complete payload */
+            cline->in_use = 0;
+            if ((sizeof(dbuf->buffer)-dbuf->offset) >=
+                HDR_LENGTH+cline->buf_len) {
+              memcpy(hdr+HDR_LENGTH, cline->buf, cline->buf_len);
+              dbuf->length = HDR_LENGTH+cline->buf_len;
+              return 1;
+            } else {
+              /* dbuf->buffer was too small */
+              cb->wstats.discard.fragment++;
+#ifdef LOG_RX_FRAGMENTS
+              printk(KERN_DEBUG "%s: rx frag buf too large (x%x > x%x-x%x-x%x)\n",
+                     cb->name, cline->buf_len, sizeof(dbuf->buffer),dbuf->offset,
+                     HDR_LENGTH);
+#endif
+              return 0;
+            }
+          }
+        } else {
+          /* new fragment's payload did not fit into cline->buf */
+#ifdef LOG_RX_FRAGMENTS
+            printk(KERN_DEBUG "%s: rx frag (len x%x) too large " 
+                   "(only x%x bytes left in cline %d)\n",
+                   cb->name, dbuf->length,
+                   sizeof(cline->buf) - cline->buf_len, i);
+#endif
+            /* cline->buf overflow */
+            cline->in_use = 0;
+            cb->wstats.discard.fragment++;
+            return 0;
+
+        }
+      } else {
+        /* fragment number in new fragment is incorrect */
+        if (cline->frag_nr != frag_nr) {
+          /* we lost a fragment ... */
+#ifdef LOG_RX_FRAGMENTS
+          printk(KERN_DEBUG "%s: rx frag: got frag_nr x%x, expected x%x\n",
+                 cb->name, frag_nr, cline->frag_nr+1);
+#endif
+          cline->in_use = 0;
+          cb->wstats.discard.fragment++;
+        } else {
+#ifdef LOG_RX_FRAGMENTS
+          printk(KERN_DEBUG "%s: rx frag ignored re-sent fragment\n",
+                 cb->name);
+#endif
+        }
+        return 0;
+      }
+    } else {
+      /* we got another sequence number */
+#ifdef LOG_RX_FRAGMENTS
+      printk(KERN_DEBUG "%s: rx frag: new seq_nr x%x (old x%x)\n",
+             cb->name, seq_nr, cline->seq_nr);
+#endif
+      cb->wstats.discard.fragment++; /* we lost a data packet */
+      if (frag_nr == 0) { 
+        /* it is the first fragment */
+        if ((frmctl_high & MOREFRAGBIT)) {
+          /* more will follow -> re-use cline entry for new data */
+          assert(sizeof(cline->buf) > (dbuf->length-HDR_LENGTH));
+          cline->buf_len = dbuf->length-HDR_LENGTH;
+          memcpy(cline->buf,hdr+HDR_LENGTH,cline->buf_len);
+          cline->seq_nr = seq_nr;
+          cline->frag_nr = 0;
+          cline->last_update = jiffies;
+#ifdef LOG_RX_FRAGMENTS
+          printk(KERN_DEBUG "%s: rx frag: re-init cline %d\n",
+                 cb->name, i);
+#endif
+          return 0; /* consumed data */
+        } else {
+          /* unfragmented rx */
+          cline->in_use = 0;
+          return 1; /* give data unchanged back */
+        }
+      } else {
+        /* another sequence number and not the first fragment */
+#ifdef LOG_RX_FRAGMENTS
+        printk(KERN_DEBUG "%s: rx frag: another seq_nr, not first frag "
+               "- skipped\n",
+               cb->name);
+#endif
+        cline->in_use = 0;
+        cb->wstats.discard.fragment++; /* we lost a data packet */
+        return 0;
+      }
+    }
+  } else {
+#ifdef LOG_RX_FRAGMENTS
+        printk(KERN_DEBUG "%s: rx frag: new addr2 "
+               "%02X:%02X:%02X:%02X:%02X:%02X "
+               "seq_nr x%x frag_nr x%x netlen x%x\n",
+               cb->name,
+               addr2[0],addr2[1],addr2[2],
+               addr2[3],addr2[4],addr2[5], seq_nr, frag_nr,
+               dbuf->length - HDR_LENGTH);
+#endif
+
+    /* we found no match for addr2 in cache */
+    if (frag_nr != 0) {
+      cb->wstats.discard.fragment++; /* we lost a data packet */
+      return 0;
+    } else {
+      assert(frmctl_high & MOREFRAGBIT);
+      if (frmctl_high & MOREFRAGBIT) {
+        /* we must store this fragment */
+        /* look for an empty entry and for the oldest updated */
+        int oldest = 0;
+        for(i=0, cline = cb->rx_cache; i < NR_RX_FRAG_CACHES; i++, cline++) {
+          if (!cline->in_use)
+            break;
+          if (cline->last_update < cb->rx_cache[oldest].last_update)
+            oldest = i;
+        }
+        if (i == NR_RX_FRAG_CACHES) {
+          /* no empty entry found, remove the oldest one */
+          cline = &cb->rx_cache[oldest];
+          i = oldest;
+          cb->wstats.discard.fragment++;
+#ifdef LOG_RX_FRAGMENTS
+          printk(KERN_DEBUG "%s: rx frag: overwrite oldest cline "
+                 "addr2 %02X:%02X:%02X:%02X:%02X:%02X "
+                 "seq_nr x%x frag_nr x%x buf_len x%x jiffies %u\n",
+                 cb->name,
+                 cline->addr2[0],cline->addr2[1],cline->addr2[2],
+                 cline->addr2[3],cline->addr2[4],cline->addr2[5],
+                 cline->seq_nr, cline->frag_nr, cline->buf_len,
+                 cline->last_update);
+#endif
+        }
+        
+        /* fill cline */
+        assert((dbuf->length - HDR_LENGTH) <= sizeof(cline->buf));
+        cline->in_use = 1;
+        memcpy(cline->addr2,addr2,ETH_ALEN);
+        cline->seq_nr = seq_nr;
+        cline->frag_nr = frag_nr;
+        cline->buf_len = dbuf->length - HDR_LENGTH;
+        memcpy(cline->buf,hdr+HDR_LENGTH,dbuf->length-HDR_LENGTH);
+        cline->last_update = jiffies;
+
+#ifdef LOG_RX_FRAGMENTS
+          printk(KERN_DEBUG "%s: rx frag: fill cline %d with "
+                 "addr2 %02X:%02X:%02X:%02X:%02X:%02X "
+                 "seq_nr x%x frag_nr x%x buf_len x%x jiffies %u\n",
+                 cb->name, i,
+                 cline->addr2[0],cline->addr2[1],cline->addr2[2],
+                 cline->addr2[3],cline->addr2[4],cline->addr2[5],
+                 cline->seq_nr, cline->frag_nr,cline->buf_len,
+                 cline->last_update);
+#endif
+
+        return 0;
+      } else {
+        /* frag_nr = 0 and no more frags -> unfragmented packet */
+        return 1;
+      }
+    }
+  }
+} /* wl24n_check_frags */
 
 /* == PROC handle_mdind == */
 void handle_mdind(WL24Cb_t *cb, Card_Word_t msgbuf)
@@ -5717,12 +5999,14 @@ void handle_mdind(WL24Cb_t *cb, Card_Word_t msgbuf)
   copy_from_card(&hdr, ind.Data, sizeof(hdr), COPY_FAST, cb);
 
   /* copy the whole frame to the WEP buffer */
+  /* start copying at the FrameControl field in RxHeader_t */
 
   RestLen = cb->databuffer.length = ind.Size - 4;
   pBuffer = cb->databuffer.buffer;
   cb->databuffer.offset = 0;
   ThisLen = min(RestLen, 210 + 24);
-  copy_from_card(pBuffer, ind.Data + 22, ThisLen, COPY_FAST, cb);
+  copy_from_card(pBuffer, ind.Data + offsetof(RxHeader_t,FrameControl),
+                 ThisLen, COPY_FAST, cb);
   pBuffer += ThisLen; RestLen -= ThisLen;
   copy_words_from_card(&ptr, ind.Data + 2, 1, cb);
   while (RestLen)
@@ -5743,9 +6027,7 @@ void handle_mdind(WL24Cb_t *cb, Card_Word_t msgbuf)
           return;
         }
     }
-
   /* otherwise discard frame if in restricted mode */
-
   else if (cb->wepstate.exclude_unencr)
     {
       printk(KERN_DEBUG "%s: received unencrypted frame in restricted mode,"
@@ -5753,14 +6035,6 @@ void handle_mdind(WL24Cb_t *cb, Card_Word_t msgbuf)
              cb->name,
              hdr.Address2[0],hdr.Address2[1],hdr.Address2[2],
              hdr.Address2[3],hdr.Address2[4],hdr.Address2[5]);
-      cb->wstats.discard.misc++;
-      return;
-    }
-
-  /* convert to 802.3 */
-
-  if (wl24unpack(&cb->databuffer, cb->llctype))
-    {
       cb->wstats.discard.misc++;
       return;
     }
@@ -5789,6 +6063,24 @@ void handle_mdind(WL24Cb_t *cb, Card_Word_t msgbuf)
 # ifdef WIRELESS_EXT
   cb->wstats.qual.level = hdr.RSSI;
 # endif
+
+  /* check for rx fragments:
+     - if this is the last fragment of a chain, this will copy the whole chain
+       into cb->databuffer and update databuffer.length accordingly, returns 1
+     - if this is not a fragment of a chain, databuffer remains unchanged, returns 1
+     - if this is a fragment and more will follow, the fragment is stored and zero returned
+     - if this is a retry packet we have already received, zero is returned
+  */
+  if (!wl24n_check_frags(cb, &cb->databuffer))
+    return;
+
+  /* convert to 802.3 */
+
+  if (wl24unpack(&cb->databuffer, cb->llctype))
+    {
+      cb->wstats.discard.misc++;
+      return;
+    }
 
   if (cb->databuffer.length <= 14) {
     /* no payload (the ELSA IL-2 sends every second an empty packet to check
@@ -6508,7 +6800,7 @@ int proc_read_bss_set(char *buf, char **start, off_t offset, int count,
                bss->BSSBasicRateSet[9],
                bss->ScanRSSI, bss->MdIndRSSI);
 
-	       
+         
  proc_read_bss_set_ende:
   *eof = 0;
 
