@@ -1,4 +1,4 @@
-/* $Id: wl24n.c,v 1.11 2003/02/17 01:05:06 jal2 Exp $ */
+/* $Id: wl24n.c,v 1.12 2003/07/04 20:15:02 jal2 Exp $ */
 /* ===========================================================    
    Copyright (C) 2002 Joerg Albert - joerg.albert@gmx.de
    Copyright (C) 2002 Alfred Arnold alfred@ccac.rwth-aachen.de
@@ -4082,7 +4082,7 @@ bool AssocReq(WL24Cb_t *cb)
      to us.  AP only set the Privacy bit in their capabilities
      if WEP is mandatory in the BSS! */
 
-  caps = cb->BSSset[cb->currBSS].CapabilityInfo;
+  caps = cb->BSSset[cb->currBSS].CapabilityInfo & 3;
   if (cb->wepstate.encrypt)
     caps |= 0x10;
   Req.CapabilityInfo = cpu_to_le16(caps);
@@ -6376,7 +6376,7 @@ void state_starting_ibss(WL24Cb_t *cb, uint8 sigid, Card_Word_t msgbuf)
                  cb->name, cb->Channel);
         newstate(cb, state_started_ibss);
         /* delay the retrieval of the IBSS BSSID */
-        mod_timer(&cb->bssid_timer, jiffies+HZ/2);
+        mod_timer(&cb->bssid_timer, jiffies+HZ);
         netif_carrier_on(cb->netdev); /* we got a carrier */
         netif_wake_queue(cb->netdev);
       } else {
