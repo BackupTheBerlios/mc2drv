@@ -1,4 +1,4 @@
-# $Id: wl24n_cs.mk,v 1.4 2003/07/06 16:40:48 jal2 Exp $
+# $Id: wl24n_cs.mk,v 1.5 2004/02/29 23:19:25 jal2 Exp $
 
 # ===========================================================    
 #    Copyright (C) 2002 Joerg Albert - joerg.albert@gmx.de
@@ -22,7 +22,7 @@ include ../config.mk
 
 LIB := ../lib
 
-CFLAGS = -O2 -Wall -Wstrict-prototypes -Winline -pipe -fno-strict-aliasing -Wno-unused-variable
+CFLAGS = -O2 -Wall -Wstrict-prototypes -Winline -pipe -fno-strict-aliasing
 
 # WL24_VERSION comes from above
 CPPFLAGS = $(PCDEBUG) -D__KERNEL__ -DMODULE -I../include \

@@ -1,4 +1,4 @@
-/* $Id: wl24n.c,v 1.13 2003/07/06 16:40:48 jal2 Exp $ */
+/* $Id: wl24n.c,v 1.14 2004/02/29 23:19:25 jal2 Exp $ */
 /* ===========================================================    
    Copyright (C) 2002 Joerg Albert - joerg.albert@gmx.de
    Copyright (C) 2002 Alfred Arnold alfred@ccac.rwth-aachen.de
@@ -28,7 +28,6 @@
 #define __NO_VERSION__    //wl24n_cs.c includes linux/module.h
 #include <linux/module.h>
 #endif
-
 
 #include <linux/config.h>
 
@@ -62,9 +61,13 @@
 #include <asm/io.h>
 #include <asm/delay.h>
 
+
 #include "wl24n_cs.h" /* the i/f we use from the pcmcia part */
 #include "wl24nfrm.h" /* 802.11 frame handling */
 #include "wl24n.h" /* our own i/f */
+
+/* our isspace - which was defined with gcc 2.9.4, but disappeared with 3.0.x */
+#define ISSPACE(x) ((x) == ' ' || (x) == '\n' || (x) == '\t')
 
 #if (LINUX_VERSION_CODE < KERNEL_VERSION(2,2,0))
 # error "kernel versions < 2.2.0 unsupported !!!"
@@ -6794,7 +6797,7 @@ ssize_t proc_write_debug(struct file *fil, const char *inbuf ,
 
 #define FILL(field) \
  do { \
-  while (isspace(*data)) {\
+  while (ISSPACE(*data)) {\
     if (++data >= (buf+len)) \
       goto proc_write_debug_ende; \
   } \
@@ -6805,7 +6808,7 @@ ssize_t proc_write_debug(struct file *fil, const char *inbuf ,
     printk(KERN_DEBUG "%s %s: invalid value for " #field ": %s\n", cb->name, __FUNCTION__, data);\
   else {\
     data = endp;\
-    cb->##field = val;\
+    cb->field = val;\
   } \
  } while (0)
 
