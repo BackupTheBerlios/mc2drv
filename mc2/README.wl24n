@@ -1,4 +1,4 @@
-$Id: README.wl24n,v 1.7 2003/01/05 15:26:33 jal2 Exp $
+$Id: README.wl24n,v 1.8 2003/01/11 23:03:46 jal2 Exp $
 
 /* ===========================================================    
     Copyright (C) 2002 Joerg Albert - joerg.albert@gmx.de
@@ -195,6 +195,7 @@ d) SuSE 7.3, 2.4.19 (external PCMCIA), pcmcia-cs 3.1.34, network = 1, LLCType = 
 
 7. History
 ----------
+- the driver runs also with Siemens I-Gate M2, added conf entry
 - version 1.52beta6
   - added support for sharing IRQs
   - added debug output of module parameters in wl24n_cs.c
