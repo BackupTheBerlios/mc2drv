@@ -1,4 +1,4 @@
-/* $Id: wl24n.c,v 1.6 2002/12/07 18:51:26 jal2 Exp $ */
+/* $Id: wl24n.c,v 1.7 2002/12/11 00:01:40 jal2 Exp $ */
 /* ===========================================================    
    Copyright (C) 2002 Joerg Albert - joerg.albert@gmx.de
    Copyright (C) 2002 Alfred Arnold alfred@ccac.rwth-aachen.de
@@ -4514,14 +4514,18 @@ void debug_msg_from_card(WL24Cb_t *cb, uint8 sigid, Card_Word_t msgbuf)
 
   case MdConfirm_ID:
     if ((cb->msg_from_dbg_mask & DBG_MDCFM) ||
-        (cb->msg_from_dbg_mask & DBG_FAILED_MDCFM) ||
+        (cb->msg_from_dbg_mask & 
+         (DBG_UNSUCC_MDCFM_OTHER|DBG_UNSUCC_MDCFM_FAIL)) ||
         (cb->trace_mask & (1 << TRACE_MSG_RCV))) {
       MdCfm_t cfm;
       copy_from_card(&cfm, msgbuf, sizeof(cfm), COPY_FAST, cb);
       assert(cfm.SignalID == MdConfirm_ID);
       if ((cb->msg_from_dbg_mask & DBG_MDCFM) || 
-          ((cb->msg_from_dbg_mask & DBG_FAILED_MDCFM) && 
-           (cfm.Status != Status_Success)))
+          ((cb->msg_from_dbg_mask & DBG_UNSUCC_MDCFM_OTHER) && 
+           (cfm.Status != StatusMdCfm_Success) &&
+           (cfm.Status != StatusMdCfm_Fail)) ||
+          ((cb->msg_from_dbg_mask & DBG_UNSUCC_MDCFM_FAIL) && 
+           (cfm.Status == StatusMdCfm_Fail)))
         printk(KERN_DEBUG "%s: MdCfm status %d prio %d serviceclass %d\n",
                cb->name, cfm.Status, cfm.Priority, cfm.ServiceClass);
 #if TRACE_NR_RECS > 0
@@ -5694,30 +5698,41 @@ void handle_mdcfm(WL24Cb_t *cb, Card_Word_t msgbuf, int do_leaky_bucket)
   netif_wake_queue(cb->netdev);
 
   if (status != StatusMdCfm_Success) {
-    cb->stats.tx_dropped++;
+    if (status == StatusMdCfm_Fail) {
+      /* in some locations in ap mode we see a lot of these Fail
+         while the packets still go through to the AP ... ?
+         -> we count them only */
+      cb->stats.tx_dropped++;
+    } else {
 
+      cb->stats.tx_errors++;
+      /* fail status, but not MdCfm_Fail */
 # ifdef WIRELESS_EXT
-    if (status == StatusMdCfm_NoBSS)
-      cb->wstats.miss.beacon++; /* jal: I hope that is the reason of "NoBSS"*/
-    else
-      cb->wstats.discard.misc++;
+      if (status == StatusMdCfm_NoBSS)
+        cb->wstats.miss.beacon++;
+      else
+        cb->wstats.discard.misc++;
 # endif
 
-    if (do_leaky_bucket) {
-      if ((cb->mdcfm_failure += MDCFM_FAIL_PENALTY) > MDCFM_RESCAN_THRE) {
-        printk(KERN_NOTICE "%s: %s: too many failed MdConfirm"
-               " (last status x%x) -> join next BSS/restart\n",
-               cb->name, __FUNCTION__, status);
-        netif_carrier_off(cb->netdev); /* we lost our carrier */
-        cb->mdcfm_failure = 0;
-        /* look into the BSS table if there is another BSS of the same networkname,
-           and try to join it first before we restart */
-        try_join_next_bss(cb,TRUE); /* try to join next matching BSS */
+      if (do_leaky_bucket) {
+        if ((cb->mdcfm_failure += MDCFM_FAIL_PENALTY) > MDCFM_RESCAN_THRE) {
+          printk(KERN_NOTICE "%s: %s: too many failed MdConfirm"
+                 " (last status x%x) -> join next BSS/restart\n",
+                 cb->name, __FUNCTION__, status);
+          netif_carrier_off(cb->netdev); /* we lost our carrier */
+          netif_stop_queue(cb->netdev);    /* stop net if */
+
+          cb->mdcfm_failure = 0;
+          /* look into the BSS table if there is another BSS of
+             the same networkname,
+             and try to join it first before we restart */
+          try_join_next_bss(cb,TRUE); /* try to join next matching BSS */
+        }
       }
     }
   } else {
-    /* status == Status_Success, data were successfully transmitted, get the length
-       from cb->txbuf_len_list and update statistics */
+    /* status == Status_Success, data were successfully transmitted,
+       get the length from cb->txbuf_len_list and update statistics */
     int nr = (cfm.Data - cb->FreeTxBufStart) / sizeof(Card_TxBuf_t);
     if (nr >= 0 && nr < cb->txbuf_len_list_len) {
       if (cb->txbuf_len_list[nr] > sizeof(TxHeader_t))
@@ -5726,7 +5741,7 @@ void handle_mdcfm(WL24Cb_t *cb, Card_Word_t msgbuf, int do_leaky_bucket)
       cb->txbuf_len_list[nr] = 0;
     }
     cb->stats.tx_packets++;
-
+    
     if (do_leaky_bucket) {
       if (cb->mdcfm_failure > 0) {
         cb->mdcfm_failure -= MDCFM_OK_VALUE;

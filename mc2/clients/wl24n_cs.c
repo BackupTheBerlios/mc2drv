@@ -1,4 +1,4 @@
-/* $Id: wl24n_cs.c,v 1.3 2002/12/07 18:51:26 jal2 Exp $ */
+/* $Id: wl24n_cs.c,v 1.4 2002/12/11 00:01:40 jal2 Exp $ */
 
 /* ===========================================================    
     Copyright (C) 2002 Joerg Albert - joerg.albert@gmx.de
@@ -103,7 +103,8 @@ MODULE_PARM_DESC(msg_to_dbg_mask,
 //INT_MODULE_PARM(msg_from_dbg_mask, 0xffffffff);
 INT_MODULE_PARM(msg_from_dbg_mask, 
 		0xffffffff & ~(DBG_MDCFM | DBG_MDIND | 
-			       DBG_MDIND_HEADER | DBG_MDIND_DATA | DBG_RX_FRAGMENTS));
+			       DBG_MDIND_HEADER | DBG_MDIND_DATA | 
+                               DBG_RX_FRAGMENTS | DBG_UNSUCC_MDCFM_FAIL));
 MODULE_PARM_DESC(msg_from_dbg_mask,
                  "controls debugging of msgs from card, see wl24n.h for meaning of bits");
 
@@ -141,7 +142,7 @@ INT_MODULE_PARM(pc_debug, PCMCIA_DEBUG);
 #define DEBUG(n, args...) if (pc_debug>(n)) printk(KERN_DEBUG args)
 /* VERSION is passed from the Makefile in a define as a string ! */
 static char *version __attribute__((unused)) =
-  __FILE__ " v" WL24_VERSION " $Id: wl24n_cs.c,v 1.3 2002/12/07 18:51:26 jal2 Exp $";
+  __FILE__ " v" WL24_VERSION " $Id: wl24n_cs.c,v 1.4 2002/12/11 00:01:40 jal2 Exp $";
 #else
 #define DEBUG(n, args...)
 #endif
@@ -679,7 +680,7 @@ static void mc2_config(dev_link_t *link)
 
   /* Finally, report what we've done */
   printk(KERN_INFO "%s: %s, version " WL24_VERSION 
-	 ", $Id: wl24n_cs.c,v 1.3 2002/12/07 18:51:26 jal2 Exp $, compiled "
+	 ", $Id: wl24n_cs.c,v 1.4 2002/12/11 00:01:40 jal2 Exp $, compiled "
 	 __DATE__ " " __TIME__ "\n", 
 	 dev->node.dev_name, __FILE__);
   printk(KERN_INFO "%s: index 0x%02x: Vcc %d.%d",
