@@ -1,4 +1,4 @@
-/* $Id: wl24n.h,v 1.5 2003/02/01 13:43:59 jal2 Exp $ */
+/* $Id: wl24n.h,v 1.6 2003/07/06 16:40:48 jal2 Exp $ */
 
 /* ===========================================================    
     Copyright (C) 2002 Joerg Albert - joerg.albert@gmx.de
@@ -154,7 +154,7 @@ typedef enum {
 void *wl24n_card_init(uint32 dbg_mask, uint32 msg_to_dbg_mask,
                       uint32 msg_from_dbg_mask,
                       int BaseAddr, int irq, LLCType_t llctype, 
-                      BSSType_t bsstype, uint8 *ESSID, int ESSID_len,
+                      BSSType_t bsstype, uint8 *ESSID, uint ESSID_len,
                       uint8 Channel, int *open_counter, char **dev_name, 
                       uint32 trace_mask);
 

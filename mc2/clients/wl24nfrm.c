@@ -1,4 +1,4 @@
-/* $Id: wl24nfrm.c,v 1.2 2003/02/01 13:43:59 jal2 Exp $ */
+/* $Id: wl24nfrm.c,v 1.3 2003/07/06 16:40:48 jal2 Exp $ */
 
 /* ===========================================================    
     Copyright (C) 2002 Alfred Arnold alfred@ccac.rwth-aachen.de
@@ -188,7 +188,7 @@ static u32 fcs32blk(u32 initializer, void* pBlk, int len)                       
 
 void wl24fill(databuffer_t *pbuffer, char *psrc, int length, int offset)
 {
-  if (length + offset < sizeof(pbuffer->buffer))
+  if (length + offset < (int)sizeof(pbuffer->buffer))
   {
     pbuffer->offset = offset;
     memcpy(pbuffer->buffer + offset, psrc, pbuffer->length = length);

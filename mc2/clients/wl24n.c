@@ -1,4 +1,4 @@
-/* $Id: wl24n.c,v 1.12 2003/07/04 20:15:02 jal2 Exp $ */
+/* $Id: wl24n.c,v 1.13 2003/07/06 16:40:48 jal2 Exp $ */
 /* ===========================================================    
    Copyright (C) 2002 Joerg Albert - joerg.albert@gmx.de
    Copyright (C) 2002 Alfred Arnold alfred@ccac.rwth-aachen.de
@@ -302,7 +302,6 @@ typedef uint32 CardAddr_t; /* bit 23-16 contain BSS above */
 typedef uint16 Card_Word_t;
 typedef Card_Word_t CardSR0Addr_t; /* an address in first SRAM page */
 static const Card_Word_t cwZero = 0;
-static const uint8 zerob = 0;
 
 #define CARDADDR_MASK_PAGE 0x380000
 #define CARDADDR_MASK_OFFS 0x007fff
@@ -633,7 +632,7 @@ typedef struct _wl24cb_t {
   uint32 trace_mask;  /* what shall we trace: trace event n, 
                          if n-th bit in mask is set */
 
-  uint32 proc_read_bss_idx;  /* two counter used in proc_read_bss/_trace */
+  int proc_read_bss_idx;  /* two counter used in proc_read_bss/_trace */
   uint32 proc_read_trace_idx;
 #ifdef CHECK_ALLOC_TXBUF
   DbgTxBuf_t *dbg_txbuf;
@@ -913,7 +912,7 @@ int dbg_txbuf_mark(WL24Cb_t *cb, Card_Word_t buf, int used, Card_Word_t parent)
 /* == PROC trace_add_data ==
    adds data entries in the trace records.
    Must be called inside the trace spinlock. */
-static void trace_add_data(WL24Cb_t *cb, uint8 *data, int len)
+static void trace_add_data(WL24Cb_t *cb, uint8 *data, uint len)
 {
   TraceEntry_t *te = &cb->trace[cb->trace_next];
 
@@ -933,7 +932,7 @@ static void trace_add_data(WL24Cb_t *cb, uint8 *data, int len)
 
 /* == PROC trace_add == 
  adds a trace entry to the buffer */
-static void trace_add(WL24Cb_t *cb, uint8 id, uint8 *data, int len)
+static void trace_add(WL24Cb_t *cb, uint8 id, uint8 *data, uint len)
 {
   unsigned long flags;
   TraceEntry_t *te;
@@ -1404,7 +1403,7 @@ static inline void copy_words_from_card(uint16 *dest, CardAddr_t src,
                                         size_t sz, WL24Cb_t *cb)
 {
   uint8 lower;
-  int i;
+  uint i;
 #ifdef LOG_COPY_PROCS
   printk(KERN_DEBUG "%s %s(%p,%x,%x,..)\n",
          cb->name, __FUNCTION__, dest, src, sz);
@@ -1532,7 +1531,7 @@ static void read_flash_params(WL24Cb_t *cb)
    reads card name, firmware date from ram (after selftest) */
 static void read_ram_params(WL24Cb_t *cb)
 {
-  int i;
+  uint i;
 
   /* get card name and firmware date */
   copy_from_card(cb->CardName, WL_CARDNAME, sizeof(cb->CardName)-1,
@@ -1690,7 +1689,7 @@ Card_Word_t alloc_txbuf(WL24Cb_t *cb, size_t sz)
     return 0;
   }
 
-  if (sz <= (cb->FreeTxBufLen * CARD_TXBUF_DATA_SIZE)) {
+  if (sz <= (size_t)(cb->FreeTxBufLen * CARD_TXBUF_DATA_SIZE)) {
 
     retval = next = cb->FreeTxBufList;
 
@@ -1733,7 +1732,7 @@ Card_Word_t alloc_txbuf(WL24Cb_t *cb, size_t sz)
 #define TIME_THRESHOLD 100
 
   if (retval == 0) {
-    int i;
+    uint i;
 #if 0
     printk(KERN_DEBUG "%s: %s need %d buffer, have only %d\n", cb->name,
            __FUNCTION__,
@@ -2145,7 +2144,7 @@ int TxDataReq(WL24Cb_t *cb, void *vsrc, uint16 len, LLCType_t llctype)
            dbg_len);
     if (cb->msg_to_dbg_mask & DBG_TXDATA_REQ_DATA) {
       uint8 buf[32];
-      int i;
+      uint i;
       copy_from_card(buf, le16_to_cpu(Req.Data)+
                      offsetof(Card_TxBuf_t,data)+sizeof(TxHeader_t),
                      sizeof(buf),
@@ -2275,7 +2274,7 @@ void getmib_bssid(unsigned long par)
 void *wl24n_card_init(uint32 dbg_mask, uint32 msg_to_dbg_mask,
                       uint32 msg_from_dbg_mask,
                       int BaseAddr, int irq, LLCType_t llctype, 
-                      BSSType_t bsstype, uint8 *essid, int essid_len,
+                      BSSType_t bsstype, uint8 *essid, uint essid_len,
                       uint8 Channel, int *open_counter, char **dev_name, uint32 trace_mask)
 {
 
@@ -2824,7 +2823,7 @@ int wl24n_ioctl(struct net_device *dev, struct ifreq *rq, int cmd)
     // Set frequency/channel
   case SIOCSIWFREQ:
     {
-      int chan = NUM_CHANNELS+1;
+      uint chan = NUM_CHANNELS+1;
 
       if (cb->dbg_mask & DBG_DEV_CALLS)
         printk(KERN_DEBUG "%s: ioctl SIOCSIWFREQ, freq.e %u freq.m %u\n", 
@@ -2833,10 +2832,11 @@ int wl24n_ioctl(struct net_device *dev, struct ifreq *rq, int cmd)
       if (wrq->u.freq.e == 0 && wrq->u.freq.m <= 1000) {
         chan = wrq->u.freq.m; // setting by channel
       } else {
-        int mult = 1, i;
+        int mult = 1;
+	int i;
         for(i=0; i < (6 - wrq->u.freq.e); i++)
           mult *= 10;
-        for(i=0; i < NUM_CHANNELS; i++)
+        for(i=0; i < (int)NUM_CHANNELS; i++)
           if (wrq->u.freq.m == frequency_list[i] * mult) {
             chan = i+1;
             break;
@@ -3202,7 +3202,7 @@ int wl24n_ioctl(struct net_device *dev, struct ifreq *rq, int cmd)
 
     index = (wrq->u.encoding.flags & IW_ENCODE_INDEX) - 1;
     if ((index < 0) || (index >= WEP_CNT))
-      index = index = cb->wepstate.txkeyid;
+      index = cb->wepstate.txkeyid;
 
     if (wrq->u.encoding.pointer)
       {
@@ -4742,7 +4742,7 @@ void debug_msg_from_card(WL24Cb_t *cb, uint8 sigid, Card_Word_t msgbuf)
         copy_from_card(buf, ind.Data+sizeof(RxHeader_t), sizeof(buf),
                        COPY_FAST, cb);
         printk(KERN_DEBUG "%s: MdInd Data ", cb->name);
-        for(i=0; i < sizeof(buf); i++) printk("%02x",buf[i]);
+        for(i=0; i < (int)sizeof(buf); i++) printk("%02x",buf[i]);
         printk("\n");
       }
 #if TRACE_NR_RECS > 0
@@ -5135,7 +5135,7 @@ void debug_msg_from_card(WL24Cb_t *cb, uint8 sigid, Card_Word_t msgbuf)
     if ((cb->msg_from_dbg_mask & DBG_SITE_CFM) || 
         (cb->trace_mask & (1 << TRACE_MSG_RCV))) {
       SiteCfm_t cfm;
-      int i;
+      uint i;
       copy_from_card(&cfm, msgbuf, sizeof(cfm), COPY_FAST, cb);
       assert(cfm.SignalID == SiteConfirm_ID);
       if (cb->msg_from_dbg_mask & DBG_SITE_CFM) {
@@ -5174,7 +5174,7 @@ void debug_msg_from_card(WL24Cb_t *cb, uint8 sigid, Card_Word_t msgbuf)
     if ((cb->msg_from_dbg_mask & DBG_RFTEST_CFM) || 
         (cb->trace_mask & (1 << TRACE_MSG_RCV))) {
       RFtestCfm_t cfm;
-      int i;
+      uint i;
       copy_from_card(&cfm, msgbuf, sizeof(cfm), COPY_FAST, cb);
       assert(cfm.SignalID == RFtestConfirm_ID);
       if (cb->msg_from_dbg_mask & DBG_RFTEST_CFM) {
@@ -5193,7 +5193,7 @@ void debug_msg_from_card(WL24Cb_t *cb, uint8 sigid, Card_Word_t msgbuf)
     /* dump first 32 byte (incl. signalID of unknown messages) */
     {
       uint8 buf[32];
-      int i;
+      uint i;
       Card_ESBQ_t esbq_cfm;
 
       copy_from_card(&buf, msgbuf+2, sizeof(buf), COPY_FAST, cb);
@@ -5964,8 +5964,8 @@ int wl24n_check_frags(WL24Cb_t *cb, databuffer_t *dbuf)
   uint16 frmctl_high = hdr[1]; /* frame control field, high byte */
   RxFragCache_t *cline;
 
-  assert(dbuf->length >= HDR_LENGTH);
-  if (dbuf->length < HDR_LENGTH)
+  assert(dbuf->length >= (int)HDR_LENGTH);
+  if (dbuf->length < (int)HDR_LENGTH)
     return 0; /* no more processing in caller */
 
   /* look for address 2 */
@@ -6860,8 +6860,10 @@ ssize_t proc_write_debug(struct file *fil, const char *inbuf ,
   WL24Cb_t *cb = dp->data;
   char const *data = buf;
   char *endp;
-  uint32 val;
-
+  uint32 val[4];
+  int nr;
+  const char *val_names[4] = {"dbg_mask", "msg_from_dbg_mask", "msg_to_dbg_mask",
+			     "trace_mask"};
   len = MIN(sizeof(buf)-1, len);
   memcpy(buf, inbuf, len);
   buf[len] = '\0';
@@ -6870,31 +6872,32 @@ ssize_t proc_write_debug(struct file *fil, const char *inbuf ,
   printk(KERN_DEBUG "%s %s: got %s\n", cb->name, __FUNCTION__, data);
 #endif
 
-#define FILL(field) \
- do { \
-  while (isspace(*data)) {\
-    if (++data >= (buf+len)) \
-      goto proc_write_debug_ende; \
-  } \
-  if (data >= (buf+len)) \
-    goto proc_write_debug_ende; \
-  val = simple_strtol(data,&endp,0);\
-  if (endp == data) \
-    printk(KERN_DEBUG "%s %s: invalid value for " #field ": %s\n", cb->name, __FUNCTION__, data);\
-  else {\
-    data = endp;\
-    cb->##field = val;\
-  } \
- } while (0)
+  nr = 0;
+  while (nr < 4 && data < (buf+len)) {
+    while (isspace(*data) && data < (buf+len))
+      data++;
+    if (data >= (buf+len))
+      break;
+    val[nr] = simple_strtol(data,&endp,0);
+    if (endp == data) {
+      printk(KERN_DEBUG "%s %s: invalid value for %s: %s\n",
+	     cb->name, __FUNCTION__, val_names[nr], data);
+      break;
+    } else
+      data = endp;
+    nr++;
+  }
 
-  FILL(dbg_mask);
-  FILL(msg_from_dbg_mask);
-  FILL(msg_to_dbg_mask);
-  FILL(trace_mask);
+  if (nr > 3)
+    cb->trace_mask = val[3];
+  if (nr > 2)
+    cb->msg_from_dbg_mask = val[2];
+  if (nr > 1)
+    cb->msg_to_dbg_mask = val[1];
+  if (nr > 0)
+    cb->dbg_mask = val[0];
 
- proc_write_debug_ende:
   return len;
-#undef FILL
 } /* proc_write_debug */
 
 
@@ -7106,8 +7109,8 @@ void wl24n_create_procdir(void)
   }
 #endif
   if ((proc_subdir=proc_mkdir(PROC_SUB_DIR, proc_root_driver)) == NULL) {
-    printk(KERN_WARNING __FUNCTION__ ": cannot create dir " PROC_SUB_DIR 
-           " in /proc/driver\n");
+    printk(KERN_WARNING "%s: cannot create dir " PROC_SUB_DIR 
+           " in /proc/driver\n", __FUNCTION__ );
     return;
   }
 
