@@ -1,4 +1,4 @@
-/* $Id: wl24n.c,v 1.9 2003/02/01 13:43:59 jal2 Exp $ */
+/* $Id: wl24n.c,v 1.10 2003/02/04 21:59:16 jal2 Exp $ */
 /* ===========================================================    
    Copyright (C) 2002 Joerg Albert - joerg.albert@gmx.de
    Copyright (C) 2002 Alfred Arnold alfred@ccac.rwth-aachen.de
@@ -6180,18 +6180,14 @@ void handle_mdind(WL24Cb_t *cb, Card_Word_t msgbuf)
     }
   
   /* decrypt frame ? */
-
-  if (cb->databuffer.buffer[cb->databuffer.offset + 1] & WEPBIT)
-    {
-      if (wl24decrypt(&cb->databuffer, &cb->wepstate))
-        {
+  if (cb->wepstate.encrypt) {
+    if (cb->databuffer.buffer[cb->databuffer.offset + 1] & WEPBIT) {
+      if (wl24decrypt(&cb->databuffer, &cb->wepstate)) {
           cb->wstats.discard.code++;
           return;
-        }
-    }
-  /* otherwise discard frame if in restricted mode */
-  else if (cb->wepstate.exclude_unencr)
-    {
+      }
+    } else if (cb->wepstate.exclude_unencr) {
+      /* otherwise discard frame if in restricted mode */
       printk(KERN_DEBUG "%s: received unencrypted frame in restricted mode,"
              " source addr %02X:%02X:%02X:%02X:%02X:%02X\n",
              cb->name,
@@ -6200,6 +6196,18 @@ void handle_mdind(WL24Cb_t *cb, Card_Word_t msgbuf)
       cb->wstats.discard.misc++;
       return;
     }
+  } else {
+    /* wepstate.encrypt == 0 */
+    if (cb->databuffer.buffer[cb->databuffer.offset + 1] & WEPBIT) {
+      printk(KERN_DEBUG "%s: received encrypted frame while encryption"
+             " is turned off, source addr %02X:%02X:%02X:%02X:%02X:%02X\n",
+             cb->name,
+             hdr.Address2[0],hdr.Address2[1],hdr.Address2[2],
+             hdr.Address2[3],hdr.Address2[4],hdr.Address2[5]);
+      cb->wstats.discard.misc++;
+      return;
+    }
+  }
 
 #if IW_MAX_SPY > 0
   {
