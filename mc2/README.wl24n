@@ -1,0 +1,285 @@
+$Id: README.wl24n,v 1.1 2002/10/28 21:09:03 jal2 Exp $
+
+/* ===========================================================    
+    Copyright (C) 2002 Joerg Albert - joerg.albert@gmx.de
+
+    Portions of the source code are based on code by
+    David A. Hinds under Copyright (C) 1999 David A. Hinds
+    and on code by Jean Tourrilhes under
+    Copyright (C) 2001 Jean Tourrilhes, HP Labs <jt@hpl.hp.com> 
+
+    This software may be used and distributed according to the
+    terms of the GNU Public License 2, incorporated herein by
+    reference.
+   =========================================================== */
+
+Hi,
+
+this driver for the ELSA Airlancer MC-2 WLAN card was derived from the
+original ELSA source for kernel 2.0.x, 2.2.x by Alfred Arnold.
+
+
+1. Requirements
+---------------
+
+a) David Hinds PCMCIA package
+b) a kernel 2.2.x or 2.4.x with correctly configured kernel sources.
+
+2. Actions
+----------
+
+a) Copy the tar archive (wl24n_cs-N.M.tgz) into the PCMCIA package's
+   root directory and untar it there.
+
+b) Call
+	./Configure ; make ; make install (last step as root)
+   If you want to install a new config file /etc/pcmcia/AirLancer.conf, 
+   call 
+	make inst_etc
+   as well.
+
+   This should produce two files:
+   - /etc/pcmcia/Airlancer.conf  (from "make inst_etc" only)
+   - /lib/modules/.../pcmcia/wl24_cs.o
+
+c) Edit the Airlancer.conf file (see Configuration below)
+
+d) Restart the cardmanager (e.g. killall -HUP cardmgr) and insert the
+   MC-2 card.
+
+
+3. Configuration
+----------------
+
+The wl24_cs.o module recognizes the following parameters:
+
+- irq_list
+  A list of up to four interrupts to select from (see PCMCIA doc)
+  default: empty
+
+- irq_mask
+    A irq mask to select from  (see PCMCIA doc)
+    default: 0xdeb8
+
+- networkname: the symbolic name of your ESS, equivalent to the WLAN
+    domain set in the LANCOM Wireless access point or the AirLancer Windows
+    driver.  This is an ASCII string of max. 32 characters.
+
+    PLEASE NOTE: A networkname of ANY doesn't catch any networkid of a BSS
+                 as it was with previous versions. Use an empty string instead.
+
+    default: empty string (i.e. matches every networkname)
+
+
+- networktype: the type of wireless network you have installed.  There
+    are tho types of network:  infrastructure (networktype=0) for workstations
+    connected to each other and to a LAN via an access point, and adhoc
+    (networktype=1) for a number of workstation interconnected to each other
+    without an access point.
+    default: 1
+
+- Channel: the RF channel to be used for communication.  Valid numbers
+    range from 1 to 13.  Note that for 'french cards', the card will only
+    accept values between 10 and 13!  This setting is only relevant if you
+    are using an adhoc network and your system is the first one on the
+    ehter; in all other cases, it will accept the channel given by other
+    stations or the access point since selection of the WLAN to join is
+    solely based on the WLAN domain string!
+    default: 4
+
+- LLCType: int
+    specifies the type of link layer used: Wavelan (1) or
+    IEEE_802_11 (2)
+    default: 1
+
+- dbg_mask: uint
+    an unsigned integer to configure debug prints to syslog
+    see wl24n.h for the meaning of the bits
+    default: 0xffffffff
+
+- msg_to_dbg_mask, msg_from_dbg_mask : uint
+    unsigned integer to configure debug prints to syslog for
+    messages to/from the PCMCIA card
+    see wl24n.h for the meaning of the bits
+    defaults:
+      msg_to_dbg_mask:    all msg except TxData
+      msg_from_dbg_mask:  all msg except RxData and confirmations for TxData 
+
+- trace_mask: uint
+    configure the trace into the internal trace buffer, which can be
+    read via /proc/driver/wl24_cs/<N>/trace. For the values see wl24n.h.
+    default: 0xffffffff
+
+
+Alternatively you can set some parameters of the driver using the 
+wireless tools iwconfig and iwpriv (supposed your device is ethX),
+after the driver is installed. If necessary the card will be resetted
+and the new parameters are used.
+
+- networkname ABCD :           "iwconfig ethX essid ABCD"
+- networktype infrastructure : "iwconfig ethX mode Managed"
+- networktype ad-hoc :         "iwconfig ethX mode Ad-hoc"
+- Channel N :                  "iwconfig ethX channel N" 
+- LLCType Wavelan :            "iwpriv ethX set_llc 1"
+- LLCType IEEE802.11 :         "iwpriv ethX set_llc 2"
+
+
+4. Information
+--------------
+The driver creates entries under /proc/driver/wl24_cs/<N>/, where
+<N> is the number from it's network device name eth<N>:
+
+- param (read-only)
+  show the parameters of the module and the current state.
+
+- hardware (read-only)
+  displays hardware info: card name, firmware version and date, MAC
+  address
+
+- bss_set (read-only)
+  shows the list of BSS found and the one we have joined (if any)
+
+- trace (read-only)
+  a trace of the last events for debugging, controlled by the
+  parameter trace_mask
+
+- debug (read/write)
+  shows the values of the four parameters
+  dbg_mask, msg_from_dbg_mask, msg_to_dbg_mask and trace_mask.
+  New values can be set by writing strings separated by white spaces,
+  e.g.
+       echo "0 0 0 -1" > debug
+  would disable all debugs to syslog, but keep all the trace.
+
+
+5. Environment
+--------------
+
+This driver was successfully tested in the following configurations:
+
+a) SuSE 7.3, kernel 2.4.18 (no kernel PCMCIA), pcmcia-cs 3.1.33, 
+     networktype = 0 (infra) / 1 (ad-hoc) LLCType = 1 (WaveLan) / 2 (IEEE802.11)
+   ad-hoc peer:          MC-2,kernel 2.2.13, pcmcia-cs 3.1.22, wl24_cs v1.31
+   access point:  ELSA IL-2
+	
+b) SuSE 7.3, 2.4.18 (external PCMCIA), pcmcia-cs 3.1.34, network = 1, LLCType = 1
+   ad-hoc peer:          MC-11, kernel 2.4.18, pcmcia-cs 3.1.34, orinoco driver
+
+c) debian, kernel 2.4.18, pcmcia-cs 3.1.33, network = 0, LLCType = ?
+   access point:  Orinoco AP 1000
+
+
+
+6. Known Bugs
+-------------
+- With heavy tracing a "cat /proc/driver/wl24_cs/N/trace" may run forever.
+  Try to take a snapshot of trace into a file and examine afterwards.
+- The /proc/driver/wl24_cs/X/ files sometimes disappear.
+
+
+7. History
+----------
+- version 1.43 (10-26-2002)
+	- added the SSID in all ScanRequests but the first one
+	  to deal with APs in "closed network" mode (e.g. Agere's APs)
+	  NOTE: This is not tested yet and requires firmware >= 2.10 !!
+	- added copyright info in all files
+	- added TODO, Acknowledgements in this file
+
+- version 1.42 (08-03-2002)
+	- fixed bug in SNAP header in transmit data. Now it works
+	  with the MC-11 in ad-hoc mode (use LLCType Wavelan).
+	- fixed bug with memory leak / crash when we lost the BSS too often
+	  and resetted the card because of failed MdCfms
+	- added debug output for tx data (first 32 byte)
+	- added support for iwspy
+	- fixed bugs in private ioctls (iwpriv tool), re-arranged their codes
+	- fixed bug in frequency display in iwconfig when camping on a IBSS
+	- iwpriv: mibset command added
+	- default for LLCType is now WaveLan (was: IEEE802.11) because most cards
+	  use this nowadays
+
+- version 1.41:
+	- fixed crash on empty data packets from IL-2
+	- compiles now with kernel 2.2.19 too
+	- manually eject of the PC Card works now / fixed bug with endless loop
+           saying unknown message 0xff hanging the system
+	- if IBSS disappears, restart the card now (if no other suitable BSS is around)
+          The driver hang on ScanReq before.
+	- ifconfig's output of tx bytes is correct now
+        - calling make install won't overwrite AirLancer.conf anymore
+	  (call make inst_etc if you want a new config file)
+	- fixed bug in proc entry "bss_set": in 1.40 it only showed the first BSS in the list,
+	  not all.
+	- invalid channels due to the frequency domain are overwritten by default channel 10
+	  (MKK domain: 14)
+	- fixed bug with multiple wl24_cs entries in /proc/driver
+ 
+- version 1.40:
+	first heavily re-written version
+
+8. Firmware Versions
+--------------------
+- 2.6
+  This version has problems to join Agere cards in AP mode, which are
+  configured for "closed network", because it always sends probe requests
+  with an empty SSID (even if another SSID was specified).
+- 2.10
+  The bug with empty SSID in probe requests was hopefully fixed - 
+  need to be tested. This firmware requires a driver version equal or 
+  above 1.43 for interworking with APs in "closed network" mode.
+
+9.  TODO
+--------
+- roaming between ESS based on RSSI values, more intelligent algorithms 
+  to choose BSS
+- describe how to update the firmware of the card
+- add WEP support in the driver
+- add support for BSS list of iwconfig
+
+10. Acknowledgements
+--------------------
+They go to Alfred Arnolds who anserwed a lot of stupid questions and 
+worked on the firmware, Heiko Kirschke who did the adaptation to the 2.4
+kernel, Stefan Goerg and all the people who spend their time with testing,
+source reading and bug reports.
+
+11. Filelist
+-----------
+(paths relative to PCMCIA root)
+ 
+./README.wl24n                       this file
+
+./wl24n_cs.mk
+./clients/wl24n_cs.mk
+./etc/wl24n_cs.mk                    Makefiles
+
+./etc/AirLancer.conf                 sample configuration
+
+./clients/{wl24n.[ch],wl24n_cs.[ch]} C source code
+./clients/wl24_cs.o                  kernel module
+
+
+12. Contact
+----------
+
+joerg.albert@gmx.de
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
