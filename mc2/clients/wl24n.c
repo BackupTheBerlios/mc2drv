@@ -1,4 +1,4 @@
-/* $Id: wl24n.c,v 1.10 2003/02/04 21:59:16 jal2 Exp $ */
+/* $Id: wl24n.c,v 1.11 2003/02/17 01:05:06 jal2 Exp $ */
 /* ===========================================================    
    Copyright (C) 2002 Joerg Albert - joerg.albert@gmx.de
    Copyright (C) 2002 Alfred Arnold alfred@ccac.rwth-aachen.de
@@ -165,7 +165,9 @@ static const uint8 zeros[IW_ESSID_MAX_SIZE] = {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
 #define aWEPUndecryptableCount               17
 #define aWEPExcludedCount                    18
 #define aMacAddress                          19
-#define aGroup_Addresses                     20
+#define aGroup_Addresses                     20 /* retrieves 5 group addresses,
+                                                   MAC addr and BSSID of 
+                                                   own started IBSS */
 #define aRTSThreshold                        21
 #define aShortRetryLimit                     22
 #define aLongRetryLimit                      23
@@ -679,6 +681,10 @@ typedef struct _wl24cb_t {
 #if (LINUX_VERSION_CODE < KERNEL_VERSION(2,4,0))
   char dev_name[32]; /* struct net_device has no buffer for name */
 #endif
+
+  struct timer_list bssid_timer; /* we use this timer only to delay
+                                    the retrieval of the BSSID when we
+                                    have started our own IBSS */
 } WL24Cb_t;
 
 
@@ -2068,6 +2074,8 @@ int TxDataReq(WL24Cb_t *cb, void *vsrc, uint16 len, LLCType_t llctype)
 
   /* convert to 802.11 */
 
+  /* jal: where to get these infos from if
+     we have started our own IBSS ??? */
   wl24pack(&cb->databuffer, llctype,
            cb->BSSset[cb->currBSS].CapabilityInfo & 1,
            cb->BSSset[cb->currBSS].BSSID);
@@ -2250,6 +2258,15 @@ void wl24n_card_stop(void *priv)
 
 } /* wl24n_card_stop */
 
+/* == PROC getmib_bssid == */
+void getmib_bssid(unsigned long par)
+{
+  WL24Cb_t *cb = (WL24Cb_t *)par;
+  /* retrieve the bssid of our own IBSS */
+  if (!GetMIBReq(cb,aGroup_Addresses))
+    printk(KERN_INFO "%s: failed to get IBSS bssid\n",
+           cb->name);
+}
 
 /* == PROC wl24n_card_init ==
    initializes the driver instance: allocates memory for the control block,
@@ -2305,6 +2322,10 @@ void *wl24n_card_init(uint32 dbg_mask, uint32 msg_to_dbg_mask,
 #if (LINUX_VERSION_CODE < KERNEL_VERSION(2,4,0))
   cb->netdev->name = cb->dev_name;
 #endif
+
+  init_timer(&cb->bssid_timer);
+  cb->bssid_timer.data = (unsigned long)cb;
+  cb->bssid_timer.function = getmib_bssid;
 
   init_waitqueue_head(&cb->waitq);
   sema_init(&cb->ioctl_mutex,1);
@@ -2579,6 +2600,13 @@ int hw_mib(WL24Cb_t *cb, int attr, void *val, size_t sz, int is_set_cmd)
 {
   int rc = 0;
 
+  /*jal: a quick hack:  aGroup_Addresses is used internally after starting
+    our own IBSS to retrieve its BSSID - rewrite the code sometime ... */
+  if (attr == aGroup_Addresses) {
+    printk(KERN_WARNING "%s: cannot retrieve aGroup_Addresses from outside\n",
+           cb->name);
+    rc = -EINVAL;
+  }
   /* serialize MIB access */
   if (down_interruptible(&cb->ioctl_mutex))
     rc = -EINTR;
@@ -2611,24 +2639,19 @@ int hw_mib(WL24Cb_t *cb, int attr, void *val, size_t sz, int is_set_cmd)
 
 
 /* == PROC hw_getbssid ==
-   gets the BSS ID of a BSS we have joined (or zeros otherwise)
-   returns 0 for failure, != 0 otherwise */
-int hw_getbssid(WL24Cb_t *cb, void *dst)
+   gets the BSS ID of a BSS we have joined or started ourselves
+   (or zeros otherwise) */
+void hw_getbssid(WL24Cb_t *cb, void *dst)
 {
-  uint8 *bssid = (uint8 *)zeros;
-
-  if (cb->state == state_joining || cb->state == state_assoc ||
+  if ((cb->state == state_joining || cb->state == state_assoc ||
       cb->state == state_auth || cb->state == state_joined_ess ||
-      cb->state == state_joined_ibss) {
+      cb->state == state_joined_ibss || cb->state == state_started_ibss) &&
+      (cb->currBSS >= 0 && cb->currBSS < NR_BSS_DESCRIPTIONS &&
+       cb->BSSset[cb->currBSS].valid)) {
     /* we have found a BSS to join */
-    assert(cb->currBSS >= 0 && cb->currBSS < NR_BSS_DESCRIPTIONS);
-    assert(cb->BSSset[cb->currBSS].valid);
-    bssid = cb->BSSset[cb->currBSS].BSSID;
-  }
-
-  memcpy(dst,bssid,ETH_ALEN);
-
-  return 1;
+    memcpy(dst, cb->BSSset[cb->currBSS].BSSID, ETH_ALEN);
+  } else
+    memcpy(dst, zeros, ETH_ALEN);
 }
 
 /* == PROC hw_getcurrentchannel == */
@@ -2922,12 +2945,8 @@ int wl24n_ioctl(struct net_device *dev, struct ifreq *rq, int cmd)
   case SIOCGIWAP:
     if (cb->dbg_mask & DBG_DEV_CALLS)
       printk(KERN_DEBUG "%s: ioctl SIOCGIWAP\n", cb->name);
-    if (!hw_getbssid(cb, wrq->u.ap_addr.sa_data)) {
-      rc = -EFAULT;
-      if (cb->dbg_mask & DBG_DEV_CALLS)
-        printk(KERN_DEBUG "%s: SIOCGIWAP returns -EFAULT\n", cb->name);
-    } else
-      wrq->u.ap_addr.sa_family = ARPHRD_ETHER;
+    hw_getbssid(cb, wrq->u.ap_addr.sa_data);
+    wrq->u.ap_addr.sa_family = ARPHRD_ETHER;
     break;
       
     /* Set desired nick name */
@@ -3779,6 +3798,30 @@ bool StartReq(WL24Cb_t *cb, uint8 channel, BSSType_t bsstype)
       (cb->msg_to_dbg_mask & DBG_START_REQ))
     printk(KERN_DEBUG "%s: StartReq ch %d bsstype %d\n",
            cb->name, channel, bsstype);
+
+  /* create an entry in BSSset[] for our own BSS and let cb->currBSS 
+     point there. If all entries are occupied, overwrite the last one. */
+  {
+    int i;
+    BSSDesc_t *bptr;
+    for(i=0,bptr=cb->BSSset; i < NR_BSS_DESCRIPTIONS-1; i++,bptr++)
+      if (!bptr->valid)
+        break;
+    memset(bptr,0,sizeof(*bptr));
+    bptr->valid = 1;
+    /* bptr->BSSID gets set later */
+    memcpy(bptr->SSID, cb->ESSID+2, cb->ESSID[1]);
+    bptr->BSSType = bsstype;
+    bptr->BeaconPeriod = BEACON_PERIOD;
+    bptr->DTIMPeriod = DTIM_PERIOD;
+    bptr->PHYpset[0] = IE_ID_DS_PARAM_SET;
+    bptr->PHYpset[1] = 1;
+    bptr->PHYpset[2] = channel;
+    bptr->CapabilityInfo = CAP_IBSS;
+    memcpy(bptr->BSSBasicRateSet, own_basic_rate_set, 
+           sizeof(own_basic_rate_set));
+    cb->currBSS = i;
+  }
 
 #if 0 //jal: for testing only
   printk(KERN_DEBUG "%s: sending StartReq: ", __FUNCTION__);
@@ -5223,10 +5266,16 @@ void wl24n_rxint(void *vcb)
       copy_from_card(&cb->last_mibcfm, msgbuf,
                      sigid == SetConfirm_ID ? sizeof(SetCfm_t) :
                      sizeof(cb->last_mibcfm), COPY_FAST, cb);
-      /* re-start the process waiting in the ioctl for completion
-         of GetMib / SetMib - if there is any !*/
-      cb->last_mibcfm_valid = 1;
-      wake_up_interruptible(&cb->waitq); /* wake up the process sleeping on queue */
+      if (cb->last_mibcfm.MibAttrib == aGroup_Addresses &&
+          sigid == GetConfirm_ID)
+        /* we use Get(aGroup_Addresses) internally */
+        (*cb->state)(cb,sigid,msgbuf);
+      else {
+        /* re-start the process waiting in the ioctl for completion
+           of GetMib / SetMib - if there is any !*/
+        cb->last_mibcfm_valid = 1;
+        wake_up_interruptible(&cb->waitq); /* wake up the process sleeping on queue */
+      }
     } else 
       /* run state function */
       (*cb->state)(cb,sigid,msgbuf);
@@ -6326,6 +6375,8 @@ void state_starting_ibss(WL24Cb_t *cb, uint8 sigid, Card_Word_t msgbuf)
           printk(KERN_DEBUG "%s: started own IBSS on channel %d\n",
                  cb->name, cb->Channel);
         newstate(cb, state_started_ibss);
+        /* delay the retrieval of the IBSS BSSID */
+        mod_timer(&cb->bssid_timer, jiffies+HZ/2);
         netif_carrier_on(cb->netdev); /* we got a carrier */
         netif_wake_queue(cb->netdev);
       } else {
@@ -6393,6 +6444,40 @@ void state_started_ibss(WL24Cb_t *cb, uint8 sigid, Card_Word_t msgbuf)
 
   case MdIndicate_ID:
     handle_mdind(cb,msgbuf);
+    break;
+
+  case GetConfirm_ID: /* we get the answer to our GetReq(aGroup_Addresses) */
+    {
+      GetCfm_t cfm;
+      copy_from_card(&cfm, msgbuf, sizeof(cfm),COPY_FAST, cb);
+      if (cfm.MibAttrib != aGroup_Addresses) {
+        printk(KERN_WARNING "%s GetMIBConfirm for unknown attr %d\n",
+               cb->name, cfm.MibAttrib);
+        break;
+      }
+      if (cfm.MibStatus != StatusMdCfm_Success) {
+        printk(KERN_WARNING "%s GetMIB(aGroup_Addresses) failed with %d\n",
+               cb->name, cfm.MibStatus);
+        break;
+      }
+
+      assert(cb->currBSS >= 0 && cb->currBSS < NR_BSS_DESCRIPTIONS);
+      memcpy(cb->BSSset[cb->currBSS].BSSID, cfm.MibValue+6*ETH_ALEN,
+             ETH_ALEN);
+#if 1
+#if 0
+      printk(KERN_DEBUG "%s MIB(aGroup_Addresses) + 30: ", cb->name);
+      dumpk(cfm.MibValue+30, MAX_MIB_VALUE_SZ-30);
+      printk("\n");
+#endif
+      printk(KERN_DEBUG "%s: own IBSS has BSSID "
+             "%02x:%02x:%02x:%02x:%02x:%02x\n",
+             cb->name,
+             cb->BSSset[cb->currBSS].BSSID[0],cb->BSSset[cb->currBSS].BSSID[1],
+             cb->BSSset[cb->currBSS].BSSID[2],cb->BSSset[cb->currBSS].BSSID[3],
+             cb->BSSset[cb->currBSS].BSSID[4],cb->BSSset[cb->currBSS].BSSID[5]);
+#endif
+    }
     break;
 
   default:
