@@ -1,4 +1,4 @@
-/* $Id: wl24n.c,v 1.4 2002/11/11 20:33:00 jal2 Exp $ */
+/* $Id: wl24n.c,v 1.5 2002/11/26 23:01:16 jal2 Exp $ */
 /* ===========================================================    
    Copyright (C) 2002 Joerg Albert - joerg.albert@gmx.de
    Copyright (C) 2002 Alfred Arnold alfred@ccac.rwth-aachen.de
@@ -3876,6 +3876,7 @@ typedef struct {
 bool AssocReq(WL24Cb_t *cb)
 {
   AssocReq_t Req;
+  uint16 caps;
 
   memset(&Req,0,sizeof(Req)); /* needed ??? */
 
@@ -3886,7 +3887,15 @@ bool AssocReq(WL24Cb_t *cb)
   Req.Timeout = cpu_to_le16(ASSOC_FAILURE_TIMEOUT);
   Req.ListenInterval = cpu_to_le16(ASSOC_LISTEN_INTERVAL);
 
-  Req.CapabilityInfo = cpu_to_le16(cb->BSSset[cb->currBSS].CapabilityInfo);
+  /* we must set the Privacy bit in the capabilites to assure an
+     Agere-based AP with optional WEP transmits encrypted frames
+     to us.  AP only set the Privacy bit in their capabilities
+     if WEP is mandatory in the BSS! */
+
+  caps = cb->BSSset[cb->currBSS].CapabilityInfo;
+  if (cb->wepstate.encrypt)
+    caps |= 0x10;
+  Req.CapabilityInfo = cpu_to_le16(caps);
 
   memcpy(Req.MacAddress, cb->BSSset[cb->currBSS].BSSID,
          sizeof(Req.MacAddress));
@@ -3902,7 +3911,6 @@ bool AssocReq(WL24Cb_t *cb)
   /* send the request */
   return request_to_card(cb,&Req,sizeof(Req));
 } /* end of AssocReq */
-
 
 typedef struct {
   uint16  NextBlock;
