@@ -1,4 +1,4 @@
-$Id: README.wl24n,v 1.2 2002/11/04 21:23:56 jal2 Exp $
+$Id: README.wl24n,v 1.3 2002/11/11 20:33:00 jal2 Exp $
 
 /* ===========================================================    
     Copyright (C) 2002 Joerg Albert - joerg.albert@gmx.de
@@ -195,6 +195,13 @@ d) SuSE 7.3, 2.4.19 (external PCMCIA), pcmcia-cs 3.1.34, network = 1, LLCType = 
 
 7. History
 ----------
+- version 1.52
+  - fixed bug with Agere access points in closed network mode (A.Arnold)
+  - fixed bug in iwspy output
+  - fixed some printk with wrong level
+  - added "iwconfig ethX ap ..." ioctl to set a specific ap (MAC) address
+    to connect to
+
 - version 1.51 (11-04-2002)
   - merged version 1.50 and 1.43
   - added support for SSID with non-printable content incl. new module

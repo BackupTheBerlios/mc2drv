@@ -1,4 +1,4 @@
-/* $Id: wl24n.c,v 1.3 2002/11/07 22:53:45 jal2 Exp $ */
+/* $Id: wl24n.c,v 1.4 2002/11/11 20:33:00 jal2 Exp $ */
 /* ===========================================================    
    Copyright (C) 2002 Joerg Albert - joerg.albert@gmx.de
    Copyright (C) 2002 Alfred Arnold alfred@ccac.rwth-aachen.de
@@ -115,11 +115,12 @@ static inline void init_waitqueue_head(wait_queue_head_t *hd)
 #define LOG_CARD_REMOVED
 //#define LOG_FREQDOMAIN
 //#define LOG_IWENCODE  /* log info on SIOC[GS]IWENCODE ioctl's */
+//#define LOG_IWSPY
 #endif //#ifdef INTERNAL_LOG
 
 /* we need <= 32 zeros to pass a dummy bssid and compare the SSID to it */
 static const uint8 zeros[IW_ESSID_MAX_SIZE] = {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
-																							 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0};
+                                               0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0};
 
 /* IEEE802.11 defines */
 #define SIZE_OF_SSID (1+1+32)
@@ -626,7 +627,17 @@ typedef struct _wl24cb_t {
 
   Wlwepstate_t wepstate;
   databuffer_t databuffer;
-  uint8 cardmode;
+  uint8 cardmode; /* 'H' for kind of "raw" mode where we set the
+                     I802.11 header, which allows to implement WEP
+                     in the driver (firmware >= 2.06 needed)
+                     'A' for the mode, where the firmware sets the
+                     header.
+                     This char is written into WL_SELFTEST_ADDR at startup. */
+
+  uint8 match_wanted_bssid; /* if != 0 a BSS must match the wanted_bssid below
+                               to be chosen */
+  uint8 wanted_bssid[ETH_ALEN]; /* if match_wanted_bssid != 0, this is
+                                   the wanted BSSID to join */
 } WL24Cb_t;
 
 
@@ -2282,6 +2293,8 @@ void *wl24n_card_init(uint32 dbg_mask, uint32 msg_to_dbg_mask,
   cb->iwspy_number = 0;
 #endif
 
+  cb->match_wanted_bssid = 0; /* initial: accept all BSSID */
+
   if (dbg_mask & DBG_DEV_CALLS)
     printk(KERN_DEBUG "%s: wl24n_card_init done\n", cb->name);
   
@@ -2595,8 +2608,10 @@ static int mc2_ioctl_getspy(WL24Cb_t *cb, struct iw_point *srq)
 	if (cb->dbg_mask & DBG_DEV_CALLS)
 	  printk(KERN_DEBUG "%s: ioctl(SIOCGIWSPY, number %d)\n", 
            cb->name, cb->iwspy_number);
-
-	number = cb->iwspy_number;
+#ifdef LOG_IWSPY
+  printk(KERN_DEBUG "%s: iwspy_number %d\n", cb->name, cb->iwspy_number);
+#endif
+	srq->length = number = cb->iwspy_number;
 
 	if ((number > 0) && (srq->pointer)) {
 	  /* Create address struct  and copy stats */
@@ -2613,13 +2628,12 @@ static int mc2_ioctl_getspy(WL24Cb_t *cb, struct iw_point *srq)
 	  }
 
 	  /* Push stuff to user space */
-	  srq->length = number;
-	  if(copy_to_user(srq->pointer, address,
+    if(copy_to_user(srq->pointer, address,
                     sizeof(struct sockaddr) * number))
-	    return -EFAULT;
-	  if(copy_to_user(srq->pointer + (sizeof(struct sockaddr)*number),
+      return -EFAULT;
+    if(copy_to_user(srq->pointer + (sizeof(struct sockaddr)*number),
                     &spy_stat, sizeof(struct iw_quality) * number))
-	    return -EFAULT;
+      return -EFAULT;
 	}
 	return 0;
 } /* mc2_ioctl_getspy */
@@ -3485,6 +3499,35 @@ int wl24n_ioctl(struct net_device *dev, struct ifreq *rq, int cmd)
     }
     break;
 
+  case SIOCSIWAP: /* set MAC address of wanted AP */
+    {
+      /* iwconfig sends this broadcast address for "ap any"
+         and a null address for "ap off" */
+      const static uint8 broad_addr[ETH_ALEN] = {0xff,0xff,0xff,0xff,0xff,0xff};
+      const static uint8 null_addr[ETH_ALEN] = {0,0,0,0,0,0};
+
+    if (cb->dbg_mask & DBG_DEV_CALLS)
+      printk(KERN_DEBUG "%s: ioctl SIOCSIWAP "
+             "%02X:%02X:%02X:%02X:%02X:%02X\n", cb->name,
+             (uint8)wrq->u.ap_addr.sa_data[0],(uint8)wrq->u.ap_addr.sa_data[1],
+             (uint8)wrq->u.ap_addr.sa_data[2],(uint8)wrq->u.ap_addr.sa_data[3],
+             (uint8)wrq->u.ap_addr.sa_data[4],(uint8)wrq->u.ap_addr.sa_data[5]);
+
+      if (memcmp(wrq->u.ap_addr.sa_data, broad_addr, ETH_ALEN) &&
+          memcmp(wrq->u.ap_addr.sa_data, null_addr, ETH_ALEN)) {
+        /* we have a valid MAC address to match */
+        cb->match_wanted_bssid = 1;
+        memcpy(cb->wanted_bssid,wrq->u.ap_addr.sa_data,ETH_ALEN);
+        need_commit = 1;
+      } else {
+        /* switch bssid matching off */
+        if (cb->match_wanted_bssid)
+          need_commit = 1;
+        cb->match_wanted_bssid = 0;
+      }
+    }
+    break;
+
     // All other calls are currently unsupported
   default:
 
@@ -3802,7 +3845,7 @@ bool AuthReq(WL24Cb_t *cb, uint16 auth_type, uint16 auth_timeout,
 
   if ((cb->dbg_mask & DBG_MSG_TO_CARD) &&
       (cb->msg_to_dbg_mask & DBG_AUTH_REQ)) {
-    printk("%s: AuthReq  type %d "
+    printk(KERN_DEBUG "%s: AuthReq type %d "
            "BSSID: %02x:%02x:%02x:%02x:%02x:%02x\n",
            cb->name, Req.Type,
            Req.MacAddress[0],Req.MacAddress[1],Req.MacAddress[2],
@@ -3850,7 +3893,7 @@ bool AssocReq(WL24Cb_t *cb)
 
   if ((cb->dbg_mask & DBG_MSG_TO_CARD) &&
       (cb->msg_to_dbg_mask & DBG_ASSOC_REQ)) {
-    printk("%s: AssocReq BSSID: %02x:%02x:%02x:%02x:%02x:%02x\n",
+    printk(KERN_DEBUG "%s: AssocReq BSSID: %02x:%02x:%02x:%02x:%02x:%02x\n",
            cb->name,
            Req.MacAddress[0],Req.MacAddress[1],Req.MacAddress[2],
            Req.MacAddress[3],Req.MacAddress[4],Req.MacAddress[5]);
@@ -4705,7 +4748,7 @@ void debug_msg_from_card(WL24Cb_t *cb, uint8 sigid, Card_Word_t msgbuf)
         if (status != Status_Success)
           printk(KERN_DEBUG "%s: JoinCfm failed status %d\n", cb->name, status);
         else {
-          printk("%s: Joining BSSID: %02x:%02x:%02x:%02x:%02x:%02x "
+          printk(KERN_DEBUG "%s: Joining BSSID: %02x:%02x:%02x:%02x:%02x:%02x "
                  "SSID len (%d)%s (",
                  cb->name,
                  bss->BSSID[0],bss->BSSID[1],bss->BSSID[2],
@@ -5097,6 +5140,21 @@ int find_matching_bss(WL24Cb_t *cb, int first_index)
         continue;
       }
 
+      if (cb->match_wanted_bssid && 
+          memcmp(cb->wanted_bssid, bss->BSSID, ETH_ALEN)) {
+#ifdef LOG_FIND_MATCHING_BSS
+        printk(KERN_DEBUG "%s %s: wanted BSSID "
+               "%02X:%02X:%02X:%02X:%02X:%02X != "
+               "%02X:%02X:%02X:%02X:%02X:%02X\n",
+               cb->name, __FUNCTION__,
+               cb->wanted_bssid[0],cb->wanted_bssid[1],cb->wanted_bssid[2],
+               cb->wanted_bssid[3],cb->wanted_bssid[4],cb->wanted_bssid[5],
+               bss->BSSID[0],bss->BSSID[1],bss->BSSID[2],
+               bss->BSSID[3],bss->BSSID[4],bss->BSSID[5]);
+#endif
+        continue;
+      }
+
       /* the BSS list may contain entries with an empty SSID
          (i.e. SSID[1] == 0) from an AP in "closed network" mode.
          Make sure that such an entry is never choosen !
@@ -5376,13 +5434,12 @@ void state_joining(WL24Cb_t *cb, uint8 sigid, Card_Word_t msgbuf)
           BSSDesc_t *bss = &cb->BSSset[cb->currBSS];
           /* we successfully joined an IBSS */
           assert(bss->CapabilityInfo & CAP_IBSS);
-          if (cb->dbg_mask & DBG_CONNECTED_BSS) {
-            printk(KERN_DEBUG "%s: connected to IBSS ID "
-                   " %02X:%02X:%02X:%02X:%02X:%02X\n",
-                   cb->name,
-                   bss->BSSID[0],bss->BSSID[1],bss->BSSID[2],
-                   bss->BSSID[3],bss->BSSID[4],bss->BSSID[5]);
-          }
+          printk(KERN_NOTICE "%s: connected to IBSS chan %d BSSID "
+                 "%02X:%02X:%02X:%02X:%02X:%02X SSID (%d)%s\n",
+                 cb->name, bss->PHYpset[2],
+                 bss->BSSID[0],bss->BSSID[1],bss->BSSID[2],
+                 bss->BSSID[3],bss->BSSID[4],bss->BSSID[5],
+                 bss->SSID[1], bss->SSID+2);
 
 # ifdef WIRELESS_EXT
           /* we start with the Scan RSSI until we get the first MdInd,
@@ -5442,7 +5499,7 @@ void state_auth(WL24Cb_t *cb, uint8 sigid, Card_Word_t msgbuf)
       }
 
       if (authtype != AuthType_OpenSystem)
-        printk(KERN_WARNING "%s: AuthCfm received with Auth type %d\n",
+        printk(KERN_DEBUG "%s: AuthCfm received with Auth type %d\n",
                cb->name, authtype);
       /* continue */
 
@@ -5515,6 +5572,13 @@ void state_assoc(WL24Cb_t *cb, uint8 sigid, Card_Word_t msgbuf)
            which may take a while */
         cb->wstats.qual.level = bss->ScanRSSI;
 # endif
+
+        printk(KERN_NOTICE "%s: connected to ESS chan %d BSSID"
+               " %02X:%02X:%02X:%02X:%02X:%02X SSID (%d)%s\n",
+               cb->name, bss->PHYpset[2],
+               bss->BSSID[0],bss->BSSID[1],bss->BSSID[2],
+               bss->BSSID[3],bss->BSSID[4],bss->BSSID[5],
+               bss->SSID[1], bss->SSID+2);
 
         newstate(cb, state_joined_ess);
         netif_carrier_on(cb->netdev); /* we got a carrier */
@@ -5594,7 +5658,7 @@ void handle_mdcfm(WL24Cb_t *cb, Card_Word_t msgbuf, int do_leaky_bucket)
 
     if (do_leaky_bucket) {
       if ((cb->mdcfm_failure += MDCFM_FAIL_PENALTY) > MDCFM_RESCAN_THRE) {
-        printk(KERN_DEBUG "%s: %s: too many failed MdConfirm"
+        printk(KERN_NOTICE "%s: %s: too many failed MdConfirm"
                " (last status x%x) -> join next BSS/restart\n",
                cb->name, __FUNCTION__, status);
         netif_carrier_off(cb->netdev); /* we lost our carrier */
