@@ -1,4 +1,4 @@
-/* $Id: wl24n.c,v 1.2 2002/11/04 21:23:56 jal2 Exp $ */
+/* $Id: wl24n.c,v 1.3 2002/11/07 22:53:45 jal2 Exp $ */
 /* ===========================================================    
    Copyright (C) 2002 Joerg Albert - joerg.albert@gmx.de
    Copyright (C) 2002 Alfred Arnold alfred@ccac.rwth-aachen.de
@@ -5163,7 +5163,7 @@ void add_bss_to_set(WL24Cb_t *cb, ScanCfm_t *cfm)
 #endif
         /* if the old entry has a non-empty SSID and the new one an empty
            do not overwrite, but skip this info */
-        if (bss->SSID[1] != 0 && cfm->SSID[1] == 0) {
+        if (bss->SSID[1] != 0 && (cfm->SSID[1] == 0 || cfm->SSID[2] == 0)) {
 #ifdef LOG_ADD_BSS_TO_SET
           printk(KERN_DEBUG "%s %s: skipped ScanCfm with empty SSID for BSSID "
                  "%02x:%02:%02x:%02x:%02:%02x with SSID (%d)%s (",
