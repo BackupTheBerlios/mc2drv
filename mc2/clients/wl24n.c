@@ -1,4 +1,4 @@
-/* $Id: wl24n.c,v 1.7 2002/12/11 00:01:40 jal2 Exp $ */
+/* $Id: wl24n.c,v 1.8 2003/01/05 15:26:33 jal2 Exp $ */
 /* ===========================================================    
    Copyright (C) 2002 Joerg Albert - joerg.albert@gmx.de
    Copyright (C) 2002 Alfred Arnold alfred@ccac.rwth-aachen.de
@@ -55,6 +55,8 @@
 #include <linux/tty.h> /* for console_print */
 #include <linux/proc_fs.h>
 
+#include <linux/tqueue.h>
+
 #include <asm/bitops.h>
 #include <asm/uaccess.h>
 #include <asm/io.h>
@@ -80,6 +82,9 @@ static inline void init_waitqueue_head(wait_queue_head_t *hd)
 #endif
 
 #define PACKED __attribute__((packed))
+
+/* define this to use the task queue tq_immediate to run rx code */
+//#define RX_USE_TASK_QUEUE
 
 /* define to just dump the incoming data packets (if dbg_mask is
    correctly set!), but don't forward them to the host's stack */
@@ -676,7 +681,7 @@ void wl24n_watchdog(struct net_device *dev);
 int wl24n_init(struct net_device *dev);
 int wl24n_open(struct net_device *dev);
 int wl24n_close(struct net_device *dev);
-void wl24n_rxint(WL24Cb_t *cb);
+void wl24n_rxint(void *cb);
 void create_proc_entries(WL24Cb_t *cb);
 void delete_proc_entries(WL24Cb_t *cb);
 
@@ -2920,16 +2925,19 @@ int wl24n_ioctl(struct net_device *dev, struct ifreq *rq, int cmd)
     if (cb->dbg_mask & DBG_DEV_CALLS)
       printk(KERN_DEBUG "%s: ioctl SIOCGIWRATE\n", cb->name);
     wrq->u.bitrate.value = 2000000;
-    wrq->u.bitrate.fixed = 1;
+    wrq->u.bitrate.fixed = 0;
     wrq->u.bitrate.disabled = 0;
     break;
 
-    // set bitrate
+    /* set bitrate (we silently accept "auto" only) */
   case SIOCSIWRATE:
     if (cb->dbg_mask & DBG_DEV_CALLS)
       printk(KERN_DEBUG "%s: ioctl SIOCSIWRATE, value %d, fixed %d\n", 
              cb->name, wrq->u.bitrate.value, wrq->u.bitrate.fixed);
-    rc = -EOPNOTSUPP;
+
+    /* the value is in kbit/s */
+    if (wrq->u.bitrate.value != -1)
+      rc = -EOPNOTSUPP;
     break;
 
     // Get the current RTS threshold
@@ -5072,8 +5080,9 @@ void debug_msg_from_card(WL24Cb_t *cb, uint8 sigid, Card_Word_t msgbuf)
 /* == PROC wl24n_rxint ==
    we got an interrupt from card:
    process all ESBQCfm's available and run the state machine. */
-void wl24n_rxint(WL24Cb_t *cb)
+void wl24n_rxint(void *vcb)
 {
+  WL24Cb_t *cb = vcb;
   Card_Word_t msgbuf; /* points to message from card */
   uint8 sigid;  /* the msgid in msgbuf */
   int nr = 0;
@@ -5126,16 +5135,35 @@ void wl24n_rxint(WL24Cb_t *cb)
 
   free_requests(cb); /* free all processed ESBQ buffers and their tx buffers */
 
-  /* acknowledge Interrupt */
-  OutB(InB(cb->BaseAddr + NIC_GCR) | GCR_ECINT, cb->BaseAddr + NIC_GCR);
-
 } /* wl24n_rxint */
 
 
 /* == PROC wl24n_interrupt == */
 void wl24n_interrupt(int irq, void *dev_id, struct pt_regs *regs)
 {
-  wl24n_rxint((WL24Cb_t *)dev_id);
+  WL24Cb_t *cb = dev_id;
+
+  /* even with this we get wrong irqs from the card resulting
+     in alarms, unknown signals, ...
+     I fear this bit is asserted too early - will try the CCSR
+     of the cs instead (in wl24n_cs.c) */
+
+  /* if (InB(cb->BaseAddr + NIC_GCR) & GCR_ECINT) */
+    /* the MC2 is the interrupt source */
+
+#ifdef RX_USE_TASK_QUEUE
+  static struct tq_struct task;
+  task.routine = wl24n_rxint;
+  task.data = cb;
+  queue_task(&task, &tq_immediate);
+  mark_bh(IMMEDIATE_BH);
+#else
+  wl24n_rxint(cb);
+#endif
+
+  /* acknowledge Interrupt */
+  OutB(InB(cb->BaseAddr + NIC_GCR) | GCR_ECINT, cb->BaseAddr + NIC_GCR);
+
 }
 
 /* == PROC state_invalid ==

@@ -1,4 +1,4 @@
-/* $Id: wl24n_cs.c,v 1.4 2002/12/11 00:01:40 jal2 Exp $ */
+/* $Id: wl24n_cs.c,v 1.5 2003/01/05 15:26:33 jal2 Exp $ */
 
 /* ===========================================================    
     Copyright (C) 2002 Joerg Albert - joerg.albert@gmx.de
@@ -122,7 +122,7 @@ MODULE_PARM_DESC(networkname,
                  "ID of ESS (or IBSS) to connect to (empty string matches all)");
 
 INT_MODULE_PARM(nwn_is_hex, 0);
-MODULE_PARM_DESC(nwn_is_nex, "is networkname given as a sequence of hex digits ?");
+MODULE_PARM_DESC(nwn_is_hex, "is networkname given as a sequence of hex digits ?");
 
 INT_MODULE_PARM(Channel, 4);
 MODULE_PARM_DESC(Channel,
@@ -142,7 +142,7 @@ INT_MODULE_PARM(pc_debug, PCMCIA_DEBUG);
 #define DEBUG(n, args...) if (pc_debug>(n)) printk(KERN_DEBUG args)
 /* VERSION is passed from the Makefile in a define as a string ! */
 static char *version __attribute__((unused)) =
-  __FILE__ " v" WL24_VERSION " $Id: wl24n_cs.c,v 1.4 2002/12/11 00:01:40 jal2 Exp $";
+  __FILE__ " v" WL24_VERSION " $Id: wl24n_cs.c,v 1.5 2003/01/05 15:26:33 jal2 Exp $";
 #else
 #define DEBUG(n, args...)
 #endif
@@ -227,33 +227,47 @@ typedef struct local_info_t {
 
 
 int hex2bin(unsigned char *ib, unsigned char *ob)
-		 /* convert a \0 terminated string of hex digits into the binary repr.
-				and returns the number of bytes created.
-				ib and ob may be the same buffer ! */
+     /* convert a \0 terminated string of hex digits into the binary repr.
+   and returns the number of bytes created.
+   ib and ob may be the same buffer ! */
 {
-	int i=0;
-	unsigned char val = 0;
+  int i=0;
+  unsigned char val = 0;
 #define HEX2BIN(x) \
  ((x) <= '9' ? (x)-'0' :\
   (x) >= 'a' && (x) <= 'f' ? (x)-'a'+10 : (x)-'A'-10)
 
-	while (*ib) {
-		if (i%2)
-			*ob++ = (val<<4) | HEX2BIN(*ib);
-		else
-			val = HEX2BIN(*ib);
-		i++;
-		ib++;
-	}
+  while (*ib) {
+    if (i%2)
+      *ob++ = (val<<4) | HEX2BIN(*ib);
+    else
+      val = HEX2BIN(*ib);
+    i++;
+    ib++;
+  }
 
-	if (i%2) {
-		/* we got an odd number of hexdigits - quietly assume a trailing 0 */
-		*ob = val<<4;
-		i++;
-	}
+  if (i%2) {
+    /* we got an odd number of hexdigits - quietly assume a trailing 0 */
+    *ob = val<<4;
+    i++;
+  }
 
-	return i/2;
+  return i/2;
 }
+
+/* == PROC wl24n_cs_interrupt == */
+/* a wrapper around wl24n_interrupt in a try
+to support shared interrupts */
+void wl24n_cs_interrupt(int irq, void *dev_id, struct pt_regs *regs)
+{
+  local_info_t *local = dev_id;
+  static conf_reg_t reg = {0, CS_READ, CISREG_CCSR, 0};
+  CardServices(AccessConfigurationRegister, local->link.handle, &reg);
+  if (reg.Value & CCSR_INTR_PENDING)
+    /* only call it when an interrupt is pending */
+    wl24n_interrupt(irq, local->mc2_priv, regs);
+}
+
 
 /*====================================================================*/
 
@@ -331,10 +345,11 @@ static dev_link_t *mc2_attach(void)
     link->release.data = (u_long)link;
 
     /* Interrupt setup */
-    link->irq.Attributes = IRQ_TYPE_EXCLUSIVE | IRQ_HANDLE_PRESENT;
+    /* link->irq.Attributes = IRQ_TYPE_EXCLUSIVE | IRQ_HANDLE_PRESENT; */
 
-    /* TODO: try to share interrupt */
-    /* link->irq.Attributes = IRQ_TYPE_DYNAMIC_SHARING|IRQ_FIRST_SHARED; */
+    /* try to share interrupt */
+    link->irq.Attributes = IRQ_TYPE_DYNAMIC_SHARING | IRQ_FIRST_SHARED |
+      IRQ_HANDLE_PRESENT;
 
     link->irq.IRQInfo1 = IRQ_INFO2_VALID|IRQ_LEVEL_ID;
     if (irq_list[0] == -1)
@@ -343,7 +358,7 @@ static dev_link_t *mc2_attach(void)
       for (i = 0; i < 4; i++)
         link->irq.IRQInfo2 |= 1 << irq_list[i];
 
-    link->irq.Handler = wl24n_interrupt;
+    link->irq.Handler = wl24n_cs_interrupt;
     
     /*
       General socket configuration defaults can go here.  In this
@@ -614,7 +629,7 @@ static void mc2_config(dev_link_t *link)
                                      link->io.BasePort1,
                                      0, /* was: link->irq.AssignedIRQ */
                                      LLCType, networktype, networkname,
-																		 nw_len, Channel, &link->open, 
+                                     nw_len, Channel, &link->open, 
                                      &dev_name, trace_mask)) == NULL) {
     printk(KERN_DEBUG "wl24_card_init failed\n");
     mc2_release((u_long)link);
@@ -629,7 +644,11 @@ static void mc2_config(dev_link_t *link)
 
   if (link->conf.Attributes & CONF_ENABLE_IRQ) {
 
-    link->irq.Instance = dev->mc2_priv;
+    /* if we use the wrapper wl24n_cs_interrupt, we must
+       pass dev here ! */
+    //link->irq.Instance = dev->mc2_priv;
+    link->irq.Instance = dev;
+
     CS_CHECK(RequestIRQ, link->handle, &link->irq);
     printk(KERN_DEBUG "%s: request irq %d at card service\n",
 	   dev_name, link->irq.AssignedIRQ);
@@ -680,7 +699,7 @@ static void mc2_config(dev_link_t *link)
 
   /* Finally, report what we've done */
   printk(KERN_INFO "%s: %s, version " WL24_VERSION 
-	 ", $Id: wl24n_cs.c,v 1.4 2002/12/11 00:01:40 jal2 Exp $, compiled "
+	 ", $Id: wl24n_cs.c,v 1.5 2003/01/05 15:26:33 jal2 Exp $, compiled "
 	 __DATE__ " " __TIME__ "\n", 
 	 dev->node.dev_name, __FILE__);
   printk(KERN_INFO "%s: index 0x%02x: Vcc %d.%d",
@@ -825,6 +844,34 @@ static int __init mc2_init(void)
     }
 
     wl24n_create_procdir();
+
+#ifdef PCMCIA_DEBUG
+    if (pc_debug > 2) {
+    /* dump the module parameter */
+      int i;
+      printk(KERN_DEBUG __FILE__  ":module parameters:\n");
+      printk(KERN_DEBUG __FILE__ ": irq_list: ");
+      i=0;
+      while (i < 4 && irq_list[i] > 0) {
+        printk("%d ",irq_list[i]);
+        i++;
+      }
+      printk("\n");
+
+      printk(KERN_DEBUG __FILE__  ": free_ports: %d irq_mask: x%x "\
+             "trace_mask x%x\n",
+             free_ports, irq_mask, trace_mask);
+      printk(KERN_DEBUG __FILE__  ": dbg_mask x%x msg_to_dbg_mask: x%x "
+             "msg_from_dbg_mask x%x\n",
+             dbg_mask, msg_to_dbg_mask, msg_from_dbg_mask);
+      printk(KERN_DEBUG __FILE__  ": LLCType %d networktype %d networkname %s "
+             "nwn_is_hex %d\n",
+             LLCType, networktype, networkname, nwn_is_hex);
+      printk(KERN_DEBUG __FILE__  ": Channel %d pc_debug %d\n",
+             Channel, pc_debug);
+    }
+#endif
+
     register_pcmcia_driver(&dev_info, &mc2_attach, &mc2_detach);
 
     return 0;
