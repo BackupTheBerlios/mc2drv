@@ -1,10 +1,10 @@
-# $Id: wl24n_cs.mk,v 1.8 2003/01/05 15:26:33 jal2 Exp $
+# $Id: wl24n_cs.mk,v 1.9 2003/02/01 13:43:59 jal2 Exp $
 
 # Makefile for wl24_cs
 #
 
 
-VERS = 1.52beta6
+VERS = 1.52beta7
 
 FILES = \
   wl24n_cs.mk \

@@ -1,4 +1,4 @@
-/* $Id: wl24n.c,v 1.8 2003/01/05 15:26:33 jal2 Exp $ */
+/* $Id: wl24n.c,v 1.9 2003/02/01 13:43:59 jal2 Exp $ */
 /* ===========================================================    
    Copyright (C) 2002 Joerg Albert - joerg.albert@gmx.de
    Copyright (C) 2002 Alfred Arnold alfred@ccac.rwth-aachen.de
@@ -121,7 +121,7 @@ static inline void init_waitqueue_head(wait_queue_head_t *hd)
 //#define LOG_FREQDOMAIN
 //#define LOG_IWENCODE  /* log info on SIOC[GS]IWENCODE ioctl's */
 //#define LOG_IWSPY
-#define LOG_RX_FRAGMENTS /* log info on rx fragments */
+//#define LOG_RX_FRAGMENTS /* log info on rx fragments */
 #endif //#ifdef INTERNAL_LOG
 
 /* we need <= 32 zeros to pass a dummy bssid and compare the SSID to it */
@@ -529,8 +529,12 @@ typedef struct {
 
 /* we spy on max. 8 mac addresses - undef and set to zero to disable and remove code 
    this define comes from linux/wireless.h */
-//#undef IW_MAX_SPY
-//#define IW_MAX_SPY 0
+
+/* WIRELESS_EXT 8 does not provide iw_point ! */
+#if WIRELESS_EXT <= 8
+#undef IW_MAX_SPY
+#define IW_MAX_SPY 0
+#endif
 
 /* struct for iwspy tool */
 typedef struct {
@@ -671,6 +675,10 @@ typedef struct _wl24cb_t {
                                to be chosen */
   uint8 wanted_bssid[ETH_ALEN]; /* if match_wanted_bssid != 0, this is
                                    the wanted BSSID to join */
+
+#if (LINUX_VERSION_CODE < KERNEL_VERSION(2,4,0))
+  char dev_name[32]; /* struct net_device has no buffer for name */
+#endif
 } WL24Cb_t;
 
 
@@ -711,6 +719,52 @@ typedef struct {
 
 /* the max size of one buffer in the chain at MdInd.Data */
 #define CARD_RXBUF_SIZE 256
+
+#if (LINUX_VERSION_CODE < KERNEL_VERSION(2,4,0))
+/**
+ * simple_strtoul - convert a string to an unsigned long
+ * @cp: The start of the string
+ * @endp: A pointer to the end of the parsed string will be placed here
+ * @base: The number base to use
+ */
+unsigned long simple_strtoul(const char *cp,char **endp,unsigned int base)
+{
+  unsigned long result = 0,value;
+
+  if (!base) {
+    base = 10;
+    if (*cp == '0') {
+      base = 8;
+      cp++;
+      if ((*cp == 'x') && isxdigit(cp[1])) {
+        cp++;
+        base = 16;
+      }
+    }
+  }
+  while (isxdigit(*cp) &&
+         (value = isdigit(*cp) ? *cp-'0' : toupper(*cp)-'A'+10) < base) {
+    result = result*base + value;
+    cp++;
+  }
+  if (endp)
+    *endp = (char *)cp;
+  return result;
+}
+
+/**
+ * simple_strtol - convert a string to a signed long
+ * @cp: The start of the string
+ * @endp: A pointer to the end of the parsed string will be placed here
+ * @base: The number base to use
+ */
+long simple_strtol(const char *cp,char **endp,unsigned int base)
+{
+  if(*cp=='-')
+    return -simple_strtoul(cp+1,endp,base);
+  return simple_strtoul(cp,endp,base);
+}
+#endif /* #if (LINUX_VERSION_CODE < KERNEL_VERSION(2,4,0)) */
 
 /* == PROC getFreqDomainDescr == */
 FreqDomainDescr_t const *getFreqDomainDescr(uint16 code)
@@ -2247,6 +2301,11 @@ void *wl24n_card_init(uint32 dbg_mask, uint32 msg_to_dbg_mask,
   //     in filling dev->master ( == 0xf800 ?)
   memset(cb->netdev,0, sizeof(struct net_device));
 
+  /* for 2.2.x we need a buffer for the name */
+#if (LINUX_VERSION_CODE < KERNEL_VERSION(2,4,0))
+  cb->netdev->name = cb->dev_name;
+#endif
+
   init_waitqueue_head(&cb->waitq);
   sema_init(&cb->ioctl_mutex,1);
   /* init netdevice 
@@ -2293,6 +2352,10 @@ void *wl24n_card_init(uint32 dbg_mask, uint32 msg_to_dbg_mask,
   cb->ESSID[1+1+cb->ESSID[1]] = '\0'; /* make it a C string */
   cb->Channel = Channel;
 
+  if (cb->netdev->name == NULL) {
+    assert(0);
+    return NULL;
+  }
   cb->netdev->name[0] = '\0'; /* let init_etherdev choose a name eth%d */
   if (!init_etherdev(cb->netdev,0)) {
     printk(KERN_WARNING "init_etherdev failed\n");
@@ -2683,7 +2746,8 @@ static int mc2_ioctl_getspy(WL24Cb_t *cb, struct iw_point *srq)
 /* our private ioctl's (even numbers are get's (world exec.),
  odd numbers are set (root only) */
 
-#if (LINUX_VERSION_CODE < KERNEL_VERSION(2,4,0))
+/* this was even defined in early 2.4.x kernels ... */
+#ifndef SIOCIWFIRSTPRIV
 #  define SIOCIWFIRSTPRIV SIOCDEVPRIVATE
 #endif
 
@@ -2718,7 +2782,7 @@ int wl24n_ioctl(struct net_device *dev, struct ifreq *rq, int cmd)
   WL24Cb_t *cb = dev->priv;
   struct iwreq *wrq = (struct iwreq *) rq;
   int rc = 0;
-  int index;
+  int index __attribute__((unused));
   int need_commit = 0; /* gets set to 1 if we must tell the card
                           some changed params */
   // Frequency list (map channels to frequencies)
@@ -2905,11 +2969,18 @@ int wl24n_ioctl(struct net_device *dev, struct ifreq *rq, int cmd)
       Card_Word_t val;
 
       if (cb->dbg_mask & DBG_DEV_CALLS)
-        printk(KERN_DEBUG "%s: ioctl SIOCSIWRTS, value %d, disabled %d\n", 
-               cb->name, wrq->u.rts.value, wrq->u.rts.disabled);
+#if WIRELESS_EXT <= 8
+        printk(KERN_DEBUG "%s: ioctl SIOCSIWRTS, value %d\n", 
+               cb->name, wrq->u.rts.value);
+#else
+      printk(KERN_DEBUG "%s: ioctl SIOCSIWRTS, value %d, disabled %d\n", 
+             cb->name, wrq->u.rts.value, wrq->u.rts.disabled);
+#endif
 
+#if WIRELESS_EXT > 8
       if(wrq->u.rts.disabled)
         rthr = 2347;
+#endif
       if((rthr < 0) || (rthr > 2347)) {
         rc = -EINVAL;
         break;
@@ -2926,7 +2997,9 @@ int wl24n_ioctl(struct net_device *dev, struct ifreq *rq, int cmd)
       printk(KERN_DEBUG "%s: ioctl SIOCGIWRATE\n", cb->name);
     wrq->u.bitrate.value = 2000000;
     wrq->u.bitrate.fixed = 0;
+#if WIRELESS_EXT > 8
     wrq->u.bitrate.disabled = 0;
+#endif
     break;
 
     /* set bitrate (we silently accept "auto" only) */
@@ -2950,7 +3023,9 @@ int wl24n_ioctl(struct net_device *dev, struct ifreq *rq, int cmd)
         
       wrq->u.rts.value = le16_to_cpu(val);
       //printk(KERN_DEBUG "SIOCGIWRTS: got val x%x\n", wrq->u.rts.value);
+#if WIRELESS_EXT > 8
       wrq->u.rts.disabled = (wrq->u.rts.value == 2347);
+#endif
       wrq->u.rts.fixed = 1;
     }
     break;
@@ -2960,11 +3035,19 @@ int wl24n_ioctl(struct net_device *dev, struct ifreq *rq, int cmd)
     {
       int fthr = wrq->u.frag.value;
       if (cb->dbg_mask & DBG_DEV_CALLS)
-        printk(KERN_DEBUG "%s: ioctl SIOCSIWFRAG, value %d, disabled %d\n", 
-               cb->name, wrq->u.frag.value, wrq->u.frag.disabled);
 
+#if WIRELESS_EXT <= 8
+        printk(KERN_DEBUG "%s: ioctl SIOCSIWFRAG, value %d\n", 
+               cb->name, wrq->u.frag.value);
+#else
+      printk(KERN_DEBUG "%s: ioctl SIOCSIWFRAG, value %d, disabled %d\n", 
+             cb->name, wrq->u.frag.value, wrq->u.frag.disabled);
+#endif
+
+#if WIRELESS_EXT > 8
       if(wrq->u.frag.disabled)
         fthr = 2346;
+#endif
       if((fthr < 256) || (fthr > 2346)) {
         rc = -EINVAL;
       } else {
@@ -2986,11 +3069,14 @@ int wl24n_ioctl(struct net_device *dev, struct ifreq *rq, int cmd)
         
       wrq->u.frag.value = le16_to_cpu(val);
       //printk(KERN_DEBUG "SIOCGIWFRAG: got val x%x\n", wrq->u.rts.value);
+#if WIRELESS_EXT > 8
       wrq->u.frag.disabled = (wrq->u.frag.value >= 2346);
+#endif
       wrq->u.frag.fixed = 1;
     }
     break;
 
+#if WIRELESS_EXT > 8
     /* Set operational mode: BSS_AnyBSS not possible here 
        (only via module parameter) */
   case SIOCSIWMODE:
@@ -3024,7 +3110,9 @@ int wl24n_ioctl(struct net_device *dev, struct ifreq *rq, int cmd)
     wrq->u.mode = (cb->bsstype == BSSType_Infrastructure ? IW_MODE_INFRA :
                    IW_MODE_ADHOC);
     break;
+#endif /* #if WIRELESS_EXT > 8 */
 
+#if WIRELESS_EXT > 8
     // Set the desired Power Management mode
     /* ELSA MC2: not sure if this works.
        Is "wake up on all DTIMs" == "no PM on MULTICAST" ??? */
@@ -3070,7 +3158,9 @@ int wl24n_ioctl(struct net_device *dev, struct ifreq *rq, int cmd)
 
     wrq->u.power.flags = 0;
     break;
+#endif /* #if WIRELESS_EXT > 8 */
 
+#if WIRELESS_EXT > 8
     // Set WEP keys and mode
   case SIOCSIWENCODE:
     if (cb->dbg_mask & DBG_DEV_CALLS)
@@ -3135,7 +3225,8 @@ int wl24n_ioctl(struct net_device *dev, struct ifreq *rq, int cmd)
     rc = 0;
 
 #ifdef LOG_IWENCODE
-    printk(KERN_DEBUG "%s: new wepstate: encrypt %d txkeyid %d exclude_unencr %d\n",
+    printk(KERN_DEBUG "%s: new wepstate: encrypt %d txkeyid %d "
+           "exclude_unencr %d\n",
            cb->name, cb->wepstate.encrypt, cb->wepstate.txkeyid,
            cb->wepstate.exclude_unencr);
 #endif
@@ -3169,7 +3260,9 @@ int wl24n_ioctl(struct net_device *dev, struct ifreq *rq, int cmd)
         rc = 0;
       }
     break;
+#endif /* #if WIRELESS_EXT > 8 */
 
+#if WIRELESS_EXT > 8
     // Get the current Tx-Power
   case SIOCGIWTXPOW:
     if (cb->dbg_mask & DBG_DEV_CALLS)
@@ -3200,6 +3293,7 @@ int wl24n_ioctl(struct net_device *dev, struct ifreq *rq, int cmd)
       rc = hw_setmib(cb, aCurrentTxPowerLevel,&level, sizeof(level));
     }
     break;
+#endif /* #if WIRELESS_EXT > 8 */
 
     // Get range of parameters
   case SIOCGIWRANGE:
@@ -3263,9 +3357,18 @@ int wl24n_ioctl(struct net_device *dev, struct ifreq *rq, int cmd)
       range.min_frag = 256;
       range.max_frag = 2346;
 
-      // WEP is not supported.
-      range.num_encoding_sizes = 0;
-      range.max_encoding_tokens = 0;
+#if WIRELESS_EXT > 8
+      // WEP is supported for certain firmware in MC2
+      if (cb->cardmode != 'H') {
+        range.num_encoding_sizes = 0;
+        range.max_encoding_tokens = 0;
+      } else {
+        range.encoding_size[0] = WEP_SMALL_KEY_SIZE;
+        range.encoding_size[1] = WEP_LARGE_KEY_SIZE;
+        range.num_encoding_sizes = 2;
+        range.max_encoding_tokens = WEP_CNT; /* nr of keys */
+      }
+#endif
 
 #if WIRELESS_EXT > 9
       /* Power Management */
@@ -3550,12 +3653,12 @@ int wl24n_ioctl(struct net_device *dev, struct ifreq *rq, int cmd)
       const static uint8 broad_addr[ETH_ALEN] = {0xff,0xff,0xff,0xff,0xff,0xff};
       const static uint8 null_addr[ETH_ALEN] = {0,0,0,0,0,0};
 
-    if (cb->dbg_mask & DBG_DEV_CALLS)
-      printk(KERN_DEBUG "%s: ioctl SIOCSIWAP "
-             "%02X:%02X:%02X:%02X:%02X:%02X\n", cb->name,
-             (uint8)wrq->u.ap_addr.sa_data[0],(uint8)wrq->u.ap_addr.sa_data[1],
-             (uint8)wrq->u.ap_addr.sa_data[2],(uint8)wrq->u.ap_addr.sa_data[3],
-             (uint8)wrq->u.ap_addr.sa_data[4],(uint8)wrq->u.ap_addr.sa_data[5]);
+      if (cb->dbg_mask & DBG_DEV_CALLS)
+        printk(KERN_DEBUG "%s: ioctl SIOCSIWAP "
+               "%02X:%02X:%02X:%02X:%02X:%02X\n", cb->name,
+               (uint8)wrq->u.ap_addr.sa_data[0],(uint8)wrq->u.ap_addr.sa_data[1],
+               (uint8)wrq->u.ap_addr.sa_data[2],(uint8)wrq->u.ap_addr.sa_data[3],
+               (uint8)wrq->u.ap_addr.sa_data[4],(uint8)wrq->u.ap_addr.sa_data[5]);
 
       if (memcmp(wrq->u.ap_addr.sa_data, broad_addr, ETH_ALEN) &&
           memcmp(wrq->u.ap_addr.sa_data, null_addr, ETH_ALEN)) {
@@ -5149,7 +5252,7 @@ void wl24n_interrupt(int irq, void *dev_id, struct pt_regs *regs)
      of the cs instead (in wl24n_cs.c) */
 
   /* if (InB(cb->BaseAddr + NIC_GCR) & GCR_ECINT) */
-    /* the MC2 is the interrupt source */
+  /* the MC2 is the interrupt source */
 
 #ifdef RX_USE_TASK_QUEUE
   static struct tq_struct task;
@@ -5253,7 +5356,7 @@ int find_matching_bss(WL24Cb_t *cb, int first_index)
                cb->ESSID+2);
         dumpk(cb->ESSID+2,cb->ESSID[1]);
         printk(") entry's SSID (%d)%s (", 
-          bss->SSID[1], &bss->SSID[2]);
+               bss->SSID[1], &bss->SSID[2]);
         dumpk(&bss->SSID[2],bss->SSID[1]);
         printk(")\n");
 #endif
@@ -5300,7 +5403,7 @@ void add_bss_to_set(WL24Cb_t *cb, ScanCfm_t *cfm)
         if (bss->SSID[1] != 0 && (cfm->SSID[1] == 0 || cfm->SSID[2] == 0)) {
 #ifdef LOG_ADD_BSS_TO_SET
           printk(KERN_DEBUG "%s %s: skipped ScanCfm with empty SSID for BSSID "
-                 "%02x:%02:%02x:%02x:%02:%02x with SSID (%d)%s (",
+                 "%02x:%02x:%02x:%02x:%02x:%02x with SSID (%d)%s (",
                  cb->name, __FUNCTION__,
                  bss->BSSID[0],bss->BSSID[1],bss->BSSID[2],
                  bss->BSSID[3],bss->BSSID[4],bss->BSSID[5],
@@ -5736,9 +5839,11 @@ void handle_mdcfm(WL24Cb_t *cb, Card_Word_t msgbuf, int do_leaky_bucket)
       cb->stats.tx_errors++;
       /* fail status, but not MdCfm_Fail */
 # ifdef WIRELESS_EXT
-      if (status == StatusMdCfm_NoBSS)
+      if (status == StatusMdCfm_NoBSS) {
+#  if WIRELESS_EXT > 8
         cb->wstats.miss.beacon++;
-      else
+#  endif
+      } else
         cb->wstats.discard.misc++;
 # endif
 
@@ -5870,7 +5975,9 @@ int wl24n_check_frags(WL24Cb_t *cb, databuffer_t *dbuf)
               return 1;
             } else {
               /* dbuf->buffer was too small */
+#if WIRELESS_EXT > 8
               cb->wstats.discard.fragment++;
+#endif
 #ifdef LOG_RX_FRAGMENTS
               printk(KERN_DEBUG "%s: rx frag buf too large (x%x > x%x-x%x-x%x)\n",
                      cb->name, cline->buf_len, sizeof(dbuf->buffer),dbuf->offset,
@@ -5882,15 +5989,17 @@ int wl24n_check_frags(WL24Cb_t *cb, databuffer_t *dbuf)
         } else {
           /* new fragment's payload did not fit into cline->buf */
 #ifdef LOG_RX_FRAGMENTS
-            printk(KERN_DEBUG "%s: rx frag (len x%x) too large " 
-                   "(only x%x bytes left in cline %d)\n",
-                   cb->name, dbuf->length,
-                   sizeof(cline->buf) - cline->buf_len, i);
+          printk(KERN_DEBUG "%s: rx frag (len x%x) too large " 
+                 "(only x%x bytes left in cline %d)\n",
+                 cb->name, dbuf->length,
+                 sizeof(cline->buf) - cline->buf_len, i);
 #endif
-            /* cline->buf overflow */
-            cline->in_use = 0;
-            cb->wstats.discard.fragment++;
-            return 0;
+          /* cline->buf overflow */
+          cline->in_use = 0;
+#if WIRELESS_EXT > 8
+          cb->wstats.discard.fragment++;
+#endif
+          return 0;
 
         }
       } else {
@@ -5902,7 +6011,9 @@ int wl24n_check_frags(WL24Cb_t *cb, databuffer_t *dbuf)
                  cb->name, frag_nr, cline->frag_nr+1);
 #endif
           cline->in_use = 0;
+#if WIRELESS_EXT > 8
           cb->wstats.discard.fragment++;
+#endif
         } else {
 #ifdef LOG_RX_FRAGMENTS
           printk(KERN_DEBUG "%s: rx frag ignored re-sent fragment\n",
@@ -5917,7 +6028,9 @@ int wl24n_check_frags(WL24Cb_t *cb, databuffer_t *dbuf)
       printk(KERN_DEBUG "%s: rx frag: new seq_nr x%x (old x%x)\n",
              cb->name, seq_nr, cline->seq_nr);
 #endif
+#if WIRELESS_EXT > 8
       cb->wstats.discard.fragment++; /* we lost a data packet */
+#endif
       if (frag_nr == 0) { 
         /* it is the first fragment */
         if ((frmctl_high & MOREFRAGBIT)) {
@@ -5946,24 +6059,28 @@ int wl24n_check_frags(WL24Cb_t *cb, databuffer_t *dbuf)
                cb->name);
 #endif
         cline->in_use = 0;
+#if WIRELESS_EXT > 8
         cb->wstats.discard.fragment++; /* we lost a data packet */
+#endif
         return 0;
       }
     }
   } else {
 #ifdef LOG_RX_FRAGMENTS
-        printk(KERN_DEBUG "%s: rx frag: new addr2 "
-               "%02X:%02X:%02X:%02X:%02X:%02X "
-               "seq_nr x%x frag_nr x%x netlen x%x\n",
-               cb->name,
-               addr2[0],addr2[1],addr2[2],
-               addr2[3],addr2[4],addr2[5], seq_nr, frag_nr,
-               dbuf->length - HDR_LENGTH);
+    printk(KERN_DEBUG "%s: rx frag: new addr2 "
+           "%02X:%02X:%02X:%02X:%02X:%02X "
+           "seq_nr x%x frag_nr x%x netlen x%x\n",
+           cb->name,
+           addr2[0],addr2[1],addr2[2],
+           addr2[3],addr2[4],addr2[5], seq_nr, frag_nr,
+           dbuf->length - HDR_LENGTH);
 #endif
 
     /* we found no match for addr2 in cache */
     if (frag_nr != 0) {
+#if WIRELESS_EXT > 8
       cb->wstats.discard.fragment++; /* we lost a data packet */
+#endif
       return 0;
     } else {
       assert(frmctl_high & MOREFRAGBIT);
@@ -5981,7 +6098,9 @@ int wl24n_check_frags(WL24Cb_t *cb, databuffer_t *dbuf)
           /* no empty entry found, remove the oldest one */
           cline = &cb->rx_cache[oldest];
           i = oldest;
+#if WIRELESS_EXT > 8
           cb->wstats.discard.fragment++;
+#endif
 #ifdef LOG_RX_FRAGMENTS
           printk(KERN_DEBUG "%s: rx frag: overwrite oldest cline "
                  "addr2 %02X:%02X:%02X:%02X:%02X:%02X "
@@ -6005,14 +6124,14 @@ int wl24n_check_frags(WL24Cb_t *cb, databuffer_t *dbuf)
         cline->last_update = jiffies;
 
 #ifdef LOG_RX_FRAGMENTS
-          printk(KERN_DEBUG "%s: rx frag: fill cline %d with "
-                 "addr2 %02X:%02X:%02X:%02X:%02X:%02X "
-                 "seq_nr x%x frag_nr x%x buf_len x%x jiffies %u\n",
-                 cb->name, i,
-                 cline->addr2[0],cline->addr2[1],cline->addr2[2],
-                 cline->addr2[3],cline->addr2[4],cline->addr2[5],
-                 cline->seq_nr, cline->frag_nr,cline->buf_len,
-                 cline->last_update);
+        printk(KERN_DEBUG "%s: rx frag: fill cline %d with "
+               "addr2 %02X:%02X:%02X:%02X:%02X:%02X "
+               "seq_nr x%x frag_nr x%x buf_len x%x jiffies %u\n",
+               cb->name, i,
+               cline->addr2[0],cline->addr2[1],cline->addr2[2],
+               cline->addr2[3],cline->addr2[4],cline->addr2[5],
+               cline->seq_nr, cline->frag_nr,cline->buf_len,
+               cline->last_update);
 #endif
 
         return 0;
@@ -6109,7 +6228,7 @@ void handle_mdind(WL24Cb_t *cb, Card_Word_t msgbuf)
 
   /* check for rx fragments:
      - if this is the last fragment of a chain, this will copy the whole chain
-       into cb->databuffer and update databuffer.length accordingly, returns 1
+     into cb->databuffer and update databuffer.length accordingly, returns 1
      - if this is not a fragment of a chain, databuffer remains unchanged, returns 1
      - if this is a fragment and more will follow, the fragment is stored and zero returned
      - if this is a retry packet we have already received, zero is returned
@@ -6877,6 +6996,9 @@ int const elen = sizeof(entries) / sizeof(struct _entries);
 
 #define PROC_SUB_DIR "wl24_cs"
 
+#if (LINUX_VERSION_CODE < KERNEL_VERSION(2,4,0))
+static struct proc_dir_entry *proc_root_driver; /* /proc/driver */
+#endif
 static struct proc_dir_entry *proc_subdir; /* the subdir for all instances of this driver */
 
 /* == PROC wl24n_create_procdir ==
@@ -6884,9 +7006,15 @@ static struct proc_dir_entry *proc_subdir; /* the subdir for all instances of th
    /proc/driver + PROC_SUB_DIR (see above) */
 void wl24n_create_procdir(void)
 {
+#if (LINUX_VERSION_CODE < KERNEL_VERSION(2,4,0))
+  if ((proc_root_driver=proc_mkdir("driver", &proc_root)) == NULL) {
+    printk(KERN_WARNING __FUNCTION__ ": cannot create /proc/driver\n"); 
+    return;
+  }
+#endif
   if ((proc_subdir=proc_mkdir(PROC_SUB_DIR, proc_root_driver)) == NULL) {
-    printk(KERN_WARNING "%s: cannot create dir " PROC_SUB_DIR " in /proc/driver\n",
-           __FUNCTION__);
+    printk(KERN_WARNING __FUNCTION__ ": cannot create dir " PROC_SUB_DIR 
+           " in /proc/driver\n");
     return;
   }
 
@@ -6902,6 +7030,9 @@ void wl24n_create_procdir(void)
 void wl24n_remove_procdir(void)
 {
   remove_proc_entry(PROC_SUB_DIR, proc_root_driver);
+#if (LINUX_VERSION_CODE < KERNEL_VERSION(2,4,0))
+  remove_proc_entry("driver", &proc_root);
+#endif
 }
 
 

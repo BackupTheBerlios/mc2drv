@@ -1,4 +1,4 @@
-/* $Id: wl24nfrm.c,v 1.1 2002/11/04 21:25:28 jal2 Exp $ */
+/* $Id: wl24nfrm.c,v 1.2 2003/02/01 13:43:59 jal2 Exp $ */
 
 /* ===========================================================    
     Copyright (C) 2002 Alfred Arnold alfred@ccac.rwth-aachen.de
@@ -31,6 +31,7 @@
 #include <linux/stddef.h>
 #include <linux/ctype.h>
 #include <linux/errno.h>
+#include <linux/sysrq.h>
 
 #include "wl24n.h"
 #include "wl24nfrm.h"

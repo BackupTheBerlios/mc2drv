@@ -1,4 +1,4 @@
-/* $Id: wl24n_cs.c,v 1.5 2003/01/05 15:26:33 jal2 Exp $ */
+/* $Id: wl24n_cs.c,v 1.6 2003/02/01 13:43:59 jal2 Exp $ */
 
 /* ===========================================================    
     Copyright (C) 2002 Joerg Albert - joerg.albert@gmx.de
@@ -52,12 +52,12 @@
 #if WIRELESS_EXT < 5
 #error "Wireless extension v5 or newer required"
 #endif
-#define WIRELESS_SPY		// enable iwspy support
-#undef HISTOGRAM		// disable histogram of signal levels
+#define WIRELESS_SPY            // enable iwspy support
+#undef HISTOGRAM                // disable histogram of signal levels
 
 // This is needed for station_name, but we may not compile WIRELESS_EXT
 #ifndef IW_ESSID_MAX_SIZE
-#define IW_ESSID_MAX_SIZE	32
+#define IW_ESSID_MAX_SIZE       32
 #endif /* IW_ESSID_MAX_SIZE */
 
 #include "wl24n.h" /* public i/f of wl24n.c */
@@ -87,23 +87,23 @@ INT_MODULE_PARM(irq_mask, 0xdeb8);
 
 INT_MODULE_PARM(trace_mask,0xffffffff);
 MODULE_PARM_DESC(trace_mask,"controls trace entries in /proc/driver/mc2/<N>/trace"
-		 "(if TRACE_NR_RECS > 0 during compile time in wl24n.c,"
-		 " see wl24n.h for details)");
+                 "(if TRACE_NR_RECS > 0 during compile time in wl24n.c,"
+                 " see wl24n.h for details)");
 
 INT_MODULE_PARM(dbg_mask,0xffffffff);
 MODULE_PARM_DESC(dbg_mask,"controls common debug msgs, see wl24n.h for meaning of bits");
 
 //INT_MODULE_PARM(msg_to_dbg_mask, 0xffffffff);
 INT_MODULE_PARM(msg_to_dbg_mask,
-		0xffffffff & ~(DBG_TXDATA_REQ|DBG_TXDATA_REQ_DATA));
+                0xffffffff & ~(DBG_TXDATA_REQ|DBG_TXDATA_REQ_DATA));
 
 MODULE_PARM_DESC(msg_to_dbg_mask,
                  "controls debugging of msgs to card, see wl24n.h for meaning of bits");
 
 //INT_MODULE_PARM(msg_from_dbg_mask, 0xffffffff);
 INT_MODULE_PARM(msg_from_dbg_mask, 
-		0xffffffff & ~(DBG_MDCFM | DBG_MDIND | 
-			       DBG_MDIND_HEADER | DBG_MDIND_DATA | 
+                0xffffffff & ~(DBG_MDCFM | DBG_MDIND | 
+                               DBG_MDIND_HEADER | DBG_MDIND_DATA | 
                                DBG_RX_FRAGMENTS | DBG_UNSUCC_MDCFM_FAIL));
 MODULE_PARM_DESC(msg_from_dbg_mask,
                  "controls debugging of msgs from card, see wl24n.h for meaning of bits");
@@ -142,7 +142,7 @@ INT_MODULE_PARM(pc_debug, PCMCIA_DEBUG);
 #define DEBUG(n, args...) if (pc_debug>(n)) printk(KERN_DEBUG args)
 /* VERSION is passed from the Makefile in a define as a string ! */
 static char *version __attribute__((unused)) =
-  __FILE__ " v" WL24_VERSION " $Id: wl24n_cs.c,v 1.5 2003/01/05 15:26:33 jal2 Exp $";
+__FILE__ " v" WL24_VERSION " $Id: wl24n_cs.c,v 1.6 2003/02/01 13:43:59 jal2 Exp $";
 #else
 #define DEBUG(n, args...)
 #endif
@@ -218,9 +218,9 @@ static dev_link_t *dev_list = NULL;
 */
    
 typedef struct local_info_t {
-  dev_link_t		link;
-  dev_node_t		node;
-  int			stop;
+  dev_link_t            link;
+  dev_node_t            node;
+  int                   stop;
   struct bus_operations *bus;
   void *mc2_priv; /* we got this from wl24_card_init() */
 } local_info_t;
@@ -257,7 +257,7 @@ int hex2bin(unsigned char *ib, unsigned char *ob)
 
 /* == PROC wl24n_cs_interrupt == */
 /* a wrapper around wl24n_interrupt in a try
-to support shared interrupts */
+   to support shared interrupts */
 void wl24n_cs_interrupt(int irq, void *dev_id, struct pt_regs *regs)
 {
   local_info_t *local = dev_id;
@@ -273,8 +273,8 @@ void wl24n_cs_interrupt(int irq, void *dev_id, struct pt_regs *regs)
 
 static void cs_error(client_handle_t handle, int func, int ret)
 {
-    error_info_t err = { func, ret };
-    CardServices(ReportError, handle, &err);
+  error_info_t err = { func, ret };
+  CardServices(ReportError, handle, &err);
 }
 
 /*------------------------------------------------------------------*/
@@ -292,8 +292,8 @@ static void cs_error(client_handle_t handle, int func, int ret)
 static void
 mc2_flush_stale_links(void)
 {
-  dev_link_t *	link;		/* Current node in linked list */
-  dev_link_t *	next;		/* Next node in linked list */
+  dev_link_t *  link;           /* Current node in linked list */
+  dev_link_t *  next;           /* Next node in linked list */
 
   DEBUG(0, "mc2_flush_stale_links(0x%p)\n", dev_list);
 
@@ -303,7 +303,7 @@ mc2_flush_stale_links(void)
     
     /* Check if in need of being removed */
     if ( (link->state & DEV_STALE_LINK) ||
-	 (!(link->state & DEV_PRESENT)))
+         (!(link->state & DEV_PRESENT)))
       mc2_detach(link);
   }
 
@@ -323,88 +323,88 @@ mc2_flush_stale_links(void)
 
 static dev_link_t *mc2_attach(void)
 {
-    local_info_t *local;
-    dev_link_t *link;
-    client_reg_t client_reg;
-    int ret, i;
+  local_info_t *local;
+  dev_link_t *link;
+  client_reg_t client_reg;
+  int ret, i;
     
-    DEBUG(0, "mc2_attach()\n");
+  DEBUG(0, "mc2_attach()\n");
 
-    /* do some clean up */
-    mc2_flush_stale_links();
+  /* do some clean up */
+  mc2_flush_stale_links();
 
-    /* Allocate space for private device-specific data */
-    local = kmalloc(sizeof(local_info_t), GFP_KERNEL);
-    if (!local) return NULL;
-    memset(local, 0, sizeof(local_info_t));
-    link = &local->link;
-    link->priv = local;
+  /* Allocate space for private device-specific data */
+  local = kmalloc(sizeof(local_info_t), GFP_KERNEL);
+  if (!local) return NULL;
+  memset(local, 0, sizeof(local_info_t));
+  link = &local->link;
+  link->priv = local;
 
-    /* Initialize the dev_link_t structure */
-    link->release.function = &mc2_release;
-    link->release.data = (u_long)link;
+  /* Initialize the dev_link_t structure */
+  link->release.function = &mc2_release;
+  link->release.data = (u_long)link;
 
-    /* Interrupt setup */
-    /* link->irq.Attributes = IRQ_TYPE_EXCLUSIVE | IRQ_HANDLE_PRESENT; */
+  /* Interrupt setup */
+  /* link->irq.Attributes = IRQ_TYPE_EXCLUSIVE | IRQ_HANDLE_PRESENT; */
 
-    /* try to share interrupt */
-    link->irq.Attributes = IRQ_TYPE_DYNAMIC_SHARING | IRQ_FIRST_SHARED |
-      IRQ_HANDLE_PRESENT;
+  /* try to share interrupt */
+  link->irq.Attributes = IRQ_TYPE_DYNAMIC_SHARING | IRQ_FIRST_SHARED |
+    IRQ_HANDLE_PRESENT;
 
-    link->irq.IRQInfo1 = IRQ_INFO2_VALID|IRQ_LEVEL_ID;
-    if (irq_list[0] == -1)
-      link->irq.IRQInfo2 = irq_mask;
-    else
-      for (i = 0; i < 4; i++)
-        link->irq.IRQInfo2 |= 1 << irq_list[i];
+  link->irq.IRQInfo1 = IRQ_INFO2_VALID|IRQ_LEVEL_ID;
+  if (irq_list[0] == -1)
+    link->irq.IRQInfo2 = irq_mask;
+  else
+    for (i = 0; i < 4; i++)
+      link->irq.IRQInfo2 |= 1 << irq_list[i];
 
-    link->irq.Handler = wl24n_cs_interrupt;
+  link->irq.Handler = wl24n_cs_interrupt;
     
-    /*
-      General socket configuration defaults can go here.  In this
-      client, we assume very little, and rely on the CIS for almost
-      everything.  In most clients, many details (i.e., number, sizes,
-      and attributes of IO windows) are fixed by the nature of the
-      device, and can be hard-wired here.
-    */
-    link->conf.Attributes = CONF_ENABLE_IRQ;
-    link->conf.Vcc = 50; /* also init. in mc2_config ??? */
-    link->conf.IntType = INT_MEMORY_AND_IO;
+  /*
+    General socket configuration defaults can go here.  In this
+    client, we assume very little, and rely on the CIS for almost
+    everything.  In most clients, many details (i.e., number, sizes,
+    and attributes of IO windows) are fixed by the nature of the
+    device, and can be hard-wired here.
+  */
+  link->conf.Attributes = CONF_ENABLE_IRQ;
+  link->conf.Vcc = 50; /* also init. in mc2_config ??? */
+  link->conf.IntType = INT_MEMORY_AND_IO;
 
-    /* additional config from original sw:
-       TODO: check what is necessary
-       and what can be taken from the CIS */
+  /* additional config from original sw:
+     TODO: check what is necessary
+     and what can be taken from the CIS */
 #if 1
-    /* The io structure describes IO port mapping */
-    link->io.NumPorts1 = 16;
-    link->io.Attributes1 = IO_DATA_PATH_WIDTH_8;
-    link->io.IOAddrLines = 5;
-    //link->conf.Attributes = CONF_ENABLE_IRQ;
-    link->conf.ConfigIndex = 1;
-    link->conf.Present = PRESENT_OPTION;
+  /* The io structure describes IO port mapping */
+  link->io.NumPorts1 = 16;
+  link->io.Attributes1 = IO_DATA_PATH_WIDTH_8;
+  link->io.IOAddrLines = 5;
+  //link->conf.Attributes = CONF_ENABLE_IRQ;
+  link->conf.ConfigIndex = 1;
+  link->conf.Present = PRESENT_OPTION;
 #endif
 
-    /* Register with Card Services */
-    link->next = dev_list;
-    dev_list = link;
-    client_reg.dev_info = &dev_info;
-    client_reg.Attributes = INFO_IO_CLIENT | INFO_CARD_SHARE;
-    client_reg.EventMask =
-      CS_EVENT_CARD_INSERTION | CS_EVENT_CARD_REMOVAL |
-      CS_EVENT_RESET_PHYSICAL | CS_EVENT_CARD_RESET |
-      CS_EVENT_PM_SUSPEND | CS_EVENT_PM_RESUME;
-    client_reg.event_handler = &mc2_event;
-    client_reg.Version = 0x0210;
-    client_reg.event_callback_args.client_data = link;
+  /* Register with Card Services */
+  link->next = dev_list;
+  dev_list = link;
+  client_reg.dev_info = &dev_info;
+  client_reg.Attributes = INFO_IO_CLIENT | INFO_CARD_SHARE;
+  client_reg.EventMask =
+    CS_EVENT_CARD_INSERTION | CS_EVENT_CARD_REMOVAL |
+    CS_EVENT_RESET_PHYSICAL | CS_EVENT_CARD_RESET |
+    CS_EVENT_PM_SUSPEND | CS_EVENT_PM_RESUME;
+  client_reg.event_handler = &mc2_event;
+  client_reg.Version = 0x0210;
+  client_reg.event_callback_args.client_data = link;
     
-    ret = CardServices(RegisterClient, &link->handle, &client_reg);
-    if (ret != CS_SUCCESS) {
-      cs_error(link->handle, RegisterClient, ret);
-      mc2_detach(link);
-      return NULL;
-    }
+  ret = CardServices(RegisterClient, &link->handle, &client_reg);
+  if (ret != CS_SUCCESS) {
+    cs_error(link->handle, RegisterClient, ret);
+    mc2_detach(link);
+    return NULL;
+  }
 
-    return link;
+  return link;
 } /* mc2_attach */
 
 
@@ -419,42 +419,42 @@ static dev_link_t *mc2_attach(void)
 
 static void mc2_detach(dev_link_t *link)
 {
-    dev_link_t **linkp;
+  dev_link_t **linkp;
 
-    DEBUG(0, "mc2_detach(0x%p)\n", link);
+  DEBUG(0, "mc2_detach(0x%p)\n", link);
     
-    /* Locate device structure */
-    for (linkp = &dev_list; *linkp; linkp = &(*linkp)->next)
-      if (*linkp == link) break;
-    if (*linkp == NULL)
+  /* Locate device structure */
+  for (linkp = &dev_list; *linkp; linkp = &(*linkp)->next)
+    if (*linkp == link) break;
+  if (*linkp == NULL)
+    return;
+
+  del_timer(&link->release);
+  if (link->state & DEV_CONFIG) {
+
+    /* try to release first */
+    mc2_release((u_long)link);
+
+    if (link->state & DEV_STALE_CONFIG) {
+      DEBUG(0, "mc2: detach postponed, '%s' "
+            "still locked\n", link->dev->dev_name);
+      link->state |= DEV_STALE_LINK;
       return;
-
-    del_timer(&link->release);
-    if (link->state & DEV_CONFIG) {
-
-      /* try to release first */
-      mc2_release((u_long)link);
-
-      if (link->state & DEV_STALE_CONFIG) {
-	DEBUG(0, "mc2: detach postponed, '%s' "
-	       "still locked\n", link->dev->dev_name);
-	link->state |= DEV_STALE_LINK;
-	return;
-      }
     }
+  }
     
-    /* Break the link with Card Services */
-    if (link->handle)
-      CardServices(DeregisterClient, link->handle);
+  /* Break the link with Card Services */
+  if (link->handle)
+    CardServices(DeregisterClient, link->handle);
     
-    /* Unlink device structure, and free it */
-    *linkp = link->next;
+  /* Unlink device structure, and free it */
+  *linkp = link->next;
     
-    if (link->priv) {
-     /* stop the device and dealloc buffers alloced in wl24_card_init() */
-      wl24n_card_stop(((local_info_t *)link->priv)->mc2_priv);
-      kfree(link->priv);
-    }
+  if (link->priv) {
+    /* stop the device and dealloc buffers alloced in wl24_card_init() */
+    wl24n_card_stop(((local_info_t *)link->priv)->mc2_priv);
+    kfree(link->priv);
+  }
 } /* mc2_detach */
 
 /*======================================================================
@@ -484,7 +484,7 @@ static void mc2_config(dev_link_t *link)
   memreq_t map;
   cistpl_cftable_entry_t dflt = { 0 };
   char *dev_name = NULL; /* get the device name from wl24n_card_init() */
-	int nw_len; /* length of networkname */
+  int nw_len; /* length of networkname */
 
 
   DEBUG(0, "mc2_config(0x%p)\n", link);
@@ -533,47 +533,47 @@ static void mc2_config(dev_link_t *link)
     if (cfg->flags & CISTPL_CFTABLE_DEFAULT) dflt = *cfg;
     if (cfg->index == 0) goto next_entry;
     link->conf.ConfigIndex = cfg->index;
-	
+        
     /* Use power settings for Vcc and Vpp if present */
     /*  Note that the CIS values need to be rescaled */
     if (cfg->vcc.present & (1<<CISTPL_POWER_VNOM)) {
-	    if (conf.Vcc != cfg->vcc.param[CISTPL_POWER_VNOM]/10000)
+      if (conf.Vcc != cfg->vcc.param[CISTPL_POWER_VNOM]/10000)
         goto next_entry;
     } else if (dflt.vcc.present & (1<<CISTPL_POWER_VNOM)) {
-	    if (conf.Vcc != dflt.vcc.param[CISTPL_POWER_VNOM]/10000)
+      if (conf.Vcc != dflt.vcc.param[CISTPL_POWER_VNOM]/10000)
         goto next_entry;
     }
-	    
+            
     if (cfg->vpp1.present & (1<<CISTPL_POWER_VNOM))
-	    link->conf.Vpp1 = link->conf.Vpp2 =
+      link->conf.Vpp1 = link->conf.Vpp2 =
         cfg->vpp1.param[CISTPL_POWER_VNOM]/10000;
     else if (dflt.vpp1.present & (1<<CISTPL_POWER_VNOM))
-	    link->conf.Vpp1 = link->conf.Vpp2 =
+      link->conf.Vpp1 = link->conf.Vpp2 =
         dflt.vpp1.param[CISTPL_POWER_VNOM]/10000;
-	
+        
     /* Do we need to allocate an interrupt? */
     if (cfg->irq.IRQInfo1 || dflt.irq.IRQInfo1)
-	    link->conf.Attributes |= CONF_ENABLE_IRQ;
-	
+      link->conf.Attributes |= CONF_ENABLE_IRQ;
+        
     /* IO window settings */
     link->io.NumPorts1 = link->io.NumPorts2 = 0;
     if ((cfg->io.nwin > 0) || (dflt.io.nwin > 0)) {
-	    cistpl_io_t *io = (cfg->io.nwin) ? &cfg->io : &dflt.io;
-	    link->io.Attributes1 = IO_DATA_PATH_WIDTH_AUTO;
-	    if (!(io->flags & CISTPL_IO_8BIT))
+      cistpl_io_t *io = (cfg->io.nwin) ? &cfg->io : &dflt.io;
+      link->io.Attributes1 = IO_DATA_PATH_WIDTH_AUTO;
+      if (!(io->flags & CISTPL_IO_8BIT))
         link->io.Attributes1 = IO_DATA_PATH_WIDTH_16;
-	    if (!(io->flags & CISTPL_IO_16BIT))
+      if (!(io->flags & CISTPL_IO_16BIT))
         link->io.Attributes1 = IO_DATA_PATH_WIDTH_8;
-	    link->io.IOAddrLines = io->flags & CISTPL_IO_LINES_MASK;
-	    link->io.BasePort1 = io->win[0].base;
-	    link->io.NumPorts1 = io->win[0].len;
-	    if (io->nwin > 1) {
+      link->io.IOAddrLines = io->flags & CISTPL_IO_LINES_MASK;
+      link->io.BasePort1 = io->win[0].base;
+      link->io.NumPorts1 = io->win[0].len;
+      if (io->nwin > 1) {
         link->io.Attributes2 = link->io.Attributes1;
         link->io.BasePort2 = io->win[1].base;
         link->io.NumPorts2 = io->win[1].len;
-	    }
-	    /* This reserves IO space but doesn't actually enable it */
-	    CFG_CHECK(RequestIO, link->handle, &link->io);
+      }
+      /* This reserves IO space but doesn't actually enable it */
+      CFG_CHECK(RequestIO, link->handle, &link->io);
     }
 
     /*
@@ -588,26 +588,26 @@ static void mc2_config(dev_link_t *link)
       is used.
     */
     if ((cfg->mem.nwin > 0) || (dflt.mem.nwin > 0)) {
-	    cistpl_mem_t *mem =
+      cistpl_mem_t *mem =
         (cfg->mem.nwin) ? &cfg->mem : &dflt.mem;
-	    req.Attributes = WIN_DATA_WIDTH_16|WIN_MEMORY_TYPE_CM;
-	    req.Attributes |= WIN_ENABLE;
-	    req.Base = mem->win[0].host_addr;
-	    req.Size = mem->win[0].len;
-	    if (req.Size < 0x1000)
-	      req.Size = 0x1000;
-	    req.AccessSpeed = 0;
-	    link->win = (window_handle_t)link->handle;
-	    CFG_CHECK(RequestWindow, &link->win, &req);
-	    map.Page = 0; map.CardOffset = mem->win[0].card_addr;
-	    CFG_CHECK(MapMemPage, link->win, &map);
+      req.Attributes = WIN_DATA_WIDTH_16|WIN_MEMORY_TYPE_CM;
+      req.Attributes |= WIN_ENABLE;
+      req.Base = mem->win[0].host_addr;
+      req.Size = mem->win[0].len;
+      if (req.Size < 0x1000)
+        req.Size = 0x1000;
+      req.AccessSpeed = 0;
+      link->win = (window_handle_t)link->handle;
+      CFG_CHECK(RequestWindow, &link->win, &req);
+      map.Page = 0; map.CardOffset = mem->win[0].card_addr;
+      CFG_CHECK(MapMemPage, link->win, &map);
     }
     /* If we got this far, we're cool! */
     break;
-	
+        
   next_entry:
     if (link->io.NumPorts1)
-	    CardServices(ReleaseIO, link->handle, &link->io);
+      CardServices(ReleaseIO, link->handle, &link->io);
     CS_CHECK(GetNextTuple, handle, &tuple);
   }
 
@@ -618,11 +618,11 @@ static void mc2_config(dev_link_t *link)
      call it before. On the other hand the RequestIRQ returns the
      correct AssignedIRQ to us ... */
   link->open = 0;
-	if (nwn_is_hex) 
-		/* condense the hex string into a binary one */
-		nw_len = hex2bin(networkname,networkname);
-	else
-		nw_len = strlen(networkname);
+  if (nwn_is_hex) 
+    /* condense the hex string into a binary one */
+    nw_len = hex2bin(networkname,networkname);
+  else
+    nw_len = strlen(networkname);
 
   if ((dev->mc2_priv=wl24n_card_init(dbg_mask, msg_to_dbg_mask,
                                      msg_from_dbg_mask,
@@ -651,7 +651,7 @@ static void mc2_config(dev_link_t *link)
 
     CS_CHECK(RequestIRQ, link->handle, &link->irq);
     printk(KERN_DEBUG "%s: request irq %d at card service\n",
-	   dev_name, link->irq.AssignedIRQ);
+           dev_name, link->irq.AssignedIRQ);
   }
 
   /*
@@ -667,7 +667,7 @@ static void mc2_config(dev_link_t *link)
     int i;
     for (i=0; i < 10; i++)
       if (wl24n_card_reset(dev->mc2_priv))
-	break;
+        break;
     if (i >= 10) {
       printk(KERN_WARNING "%s: cannot reset card - giving up\n", dev_name);
       mc2_detach(link); /* calls mc2_release((u_long)link), too */
@@ -682,9 +682,9 @@ static void mc2_config(dev_link_t *link)
   */
   if (free_ports) {
     if (link->io.BasePort1)
-	    release_region(link->io.BasePort1, link->io.NumPorts1);
+      release_region(link->io.BasePort1, link->io.NumPorts1);
     if (link->io.BasePort2)
-	    release_region(link->io.BasePort2, link->io.NumPorts2);
+      release_region(link->io.BasePort2, link->io.NumPorts2);
   }
 
   /*
@@ -699,9 +699,9 @@ static void mc2_config(dev_link_t *link)
 
   /* Finally, report what we've done */
   printk(KERN_INFO "%s: %s, version " WL24_VERSION 
-	 ", $Id: wl24n_cs.c,v 1.5 2003/01/05 15:26:33 jal2 Exp $, compiled "
-	 __DATE__ " " __TIME__ "\n", 
-	 dev->node.dev_name, __FILE__);
+         ", $Id: wl24n_cs.c,v 1.6 2003/02/01 13:43:59 jal2 Exp $, compiled "
+         __DATE__ " " __TIME__ "\n", 
+         dev->node.dev_name, __FILE__);
   printk(KERN_INFO "%s: index 0x%02x: Vcc %d.%d",
          dev->node.dev_name, link->conf.ConfigIndex,
          link->conf.Vcc/10, link->conf.Vcc%10);
@@ -766,9 +766,9 @@ static void mc2_release(u_long arg)
   /* mc2_detach must not be called from here, because mc2_release runs on
      interrupt level (called by some timer in soft_irq) und mc2_detach
      calls unregister_netdev() ! */
-//  if (link->state & DEV_STALE_LINK)
-//    /* detach was postponed before */
-//    mc2_detach(link);
+  //  if (link->state & DEV_STALE_LINK)
+  //    /* detach was postponed before */
+  //    mc2_detach(link);
   
 } /* mc2_release */
 
@@ -777,117 +777,117 @@ static void mc2_release(u_long arg)
 static int mc2_event(event_t event, int priority,
                      event_callback_args_t *args)
 {
-    dev_link_t *link = args->client_data;
+  dev_link_t *link = args->client_data;
 
-    DEBUG(1, "mc2_event(0x%06x)\n", event);
+  DEBUG(1, "mc2_event(0x%06x)\n", event);
     
-    switch (event) {
+  switch (event) {
 
-    case CS_EVENT_CARD_REMOVAL:
-        link->state &= ~DEV_PRESENT;
-        if (link->state & DEV_CONFIG) {
-          /* stop the net i/f of the driver */
-          wl24n_card_netif_stop(((local_info_t *)link->priv)->mc2_priv);
-          link->release.expires = RUN_AT(HZ/20);
-          add_timer(&link->release);
-        }
-        break;
+  case CS_EVENT_CARD_REMOVAL:
+    link->state &= ~DEV_PRESENT;
+    if (link->state & DEV_CONFIG) {
+      /* stop the net i/f of the driver */
+      wl24n_card_netif_stop(((local_info_t *)link->priv)->mc2_priv);
+      link->release.expires = RUN_AT(HZ/20);
+      add_timer(&link->release);
+    }
+    break;
 
-    case CS_EVENT_CARD_INSERTION:
-        link->state |= DEV_PRESENT | DEV_CONFIG_PENDING;
-        mc2_config(link);
-        break;
+  case CS_EVENT_CARD_INSERTION:
+    link->state |= DEV_PRESENT | DEV_CONFIG_PENDING;
+    mc2_config(link);
+    break;
 
-    case CS_EVENT_PM_SUSPEND:
-        link->state |= DEV_SUSPEND;
-        /* Fall through... */
+  case CS_EVENT_PM_SUSPEND:
+    link->state |= DEV_SUSPEND;
+    /* Fall through... */
 
-    case CS_EVENT_RESET_PHYSICAL:
-        if (link->state & DEV_CONFIG) {
-            if (link->open) {
-              wl24n_card_netif_stop(((local_info_t *)
-                                     link->priv)->mc2_priv);
-            }
-            CardServices(ReleaseConfiguration, link->handle);
-        }
-        break;
+  case CS_EVENT_RESET_PHYSICAL:
+    if (link->state & DEV_CONFIG) {
+      if (link->open) {
+        wl24n_card_netif_stop(((local_info_t *)
+                               link->priv)->mc2_priv);
+      }
+      CardServices(ReleaseConfiguration, link->handle);
+    }
+    break;
 
-    case CS_EVENT_PM_RESUME:
-        link->state &= ~DEV_SUSPEND;
-        /* Fall through... */
-    case CS_EVENT_CARD_RESET:
-        if (link->state & DEV_CONFIG) {
-            CardServices(RequestConfiguration, link->handle, &link->conf);
-            if (link->open) {
-              wl24n_card_reset(((local_info_t *)link->priv)->mc2_priv);
-            }
-        }
-        break;
+  case CS_EVENT_PM_RESUME:
+    link->state &= ~DEV_SUSPEND;
+    /* Fall through... */
+  case CS_EVENT_CARD_RESET:
+    if (link->state & DEV_CONFIG) {
+      CardServices(RequestConfiguration, link->handle, &link->conf);
+      if (link->open) {
+        wl24n_card_reset(((local_info_t *)link->priv)->mc2_priv);
+      }
+    }
+    break;
 
-    default:
-      printk(KERN_WARNING "mc2_event: unknown event x%08x\n",event);
-    } /* switch (event) */
+  default:
+    printk(KERN_WARNING "mc2_event: unknown event x%08x\n",event);
+  } /* switch (event) */
 
-    return 0;
+  return 0;
 } /* mc2_event */
 
 /*====================================================================*/
 static int __init mc2_init(void)
 {
-    servinfo_t serv;
-    CardServices(GetCardServicesInfo, &serv);
-    if (serv.Revision != CS_RELEASE_CODE) {
-        printk(KERN_NOTICE "wl24_cs: Card Services release does not match!\n"
-               "Compiled with 0x%x, but current is 0x%lx\n", 
-               CS_RELEASE_CODE, (long)serv.Revision);
-        /* return -1; */
-    }
+  servinfo_t serv;
+  CardServices(GetCardServicesInfo, &serv);
+  if (serv.Revision != CS_RELEASE_CODE) {
+    printk(KERN_NOTICE "wl24_cs: Card Services release does not match!\n"
+           "Compiled with 0x%x, but current is 0x%lx\n", 
+           CS_RELEASE_CODE, (long)serv.Revision);
+    /* return -1; */
+  }
 
-    wl24n_create_procdir();
+  wl24n_create_procdir();
 
 #ifdef PCMCIA_DEBUG
-    if (pc_debug > 2) {
+  if (pc_debug > 2) {
     /* dump the module parameter */
-      int i;
-      printk(KERN_DEBUG __FILE__  ":module parameters:\n");
-      printk(KERN_DEBUG __FILE__ ": irq_list: ");
-      i=0;
-      while (i < 4 && irq_list[i] > 0) {
-        printk("%d ",irq_list[i]);
-        i++;
-      }
-      printk("\n");
-
-      printk(KERN_DEBUG __FILE__  ": free_ports: %d irq_mask: x%x "\
-             "trace_mask x%x\n",
-             free_ports, irq_mask, trace_mask);
-      printk(KERN_DEBUG __FILE__  ": dbg_mask x%x msg_to_dbg_mask: x%x "
-             "msg_from_dbg_mask x%x\n",
-             dbg_mask, msg_to_dbg_mask, msg_from_dbg_mask);
-      printk(KERN_DEBUG __FILE__  ": LLCType %d networktype %d networkname %s "
-             "nwn_is_hex %d\n",
-             LLCType, networktype, networkname, nwn_is_hex);
-      printk(KERN_DEBUG __FILE__  ": Channel %d pc_debug %d\n",
-             Channel, pc_debug);
+    int i;
+    printk(KERN_DEBUG __FILE__  ":module parameters:\n");
+    printk(KERN_DEBUG __FILE__ ": irq_list: ");
+    i=0;
+    while (i < 4 && irq_list[i] > 0) {
+      printk("%d ",irq_list[i]);
+      i++;
     }
+    printk("\n");
+
+    printk(KERN_DEBUG __FILE__  ": free_ports: %d irq_mask: x%x "\
+           "trace_mask x%x\n",
+           free_ports, irq_mask, trace_mask);
+    printk(KERN_DEBUG __FILE__  ": dbg_mask x%x msg_to_dbg_mask: x%x "
+           "msg_from_dbg_mask x%x\n",
+           dbg_mask, msg_to_dbg_mask, msg_from_dbg_mask);
+    printk(KERN_DEBUG __FILE__  ": LLCType %d networktype %d networkname %s "
+           "nwn_is_hex %d\n",
+           LLCType, networktype, networkname, nwn_is_hex);
+    printk(KERN_DEBUG __FILE__  ": Channel %d pc_debug %d\n",
+           Channel, pc_debug);
+  }
 #endif
 
-    register_pcmcia_driver(&dev_info, &mc2_attach, &mc2_detach);
+  register_pcmcia_driver(&dev_info, &mc2_attach, &mc2_detach);
 
-    return 0;
+  return 0;
 }
 
 static void __exit mc2_cleanup(void)
 {
-    DEBUG(1, "wl24n_cs: unloading\n");
-    mc2_flush_stale_links();
-    if (dev_list != NULL)
-      printk(KERN_DEBUG "wl24n_cs: devices remained on cleanup - "
-	     "time for reboot !\n");
+  DEBUG(1, "wl24n_cs: unloading\n");
+  mc2_flush_stale_links();
+  if (dev_list != NULL)
+    printk(KERN_DEBUG "wl24n_cs: devices remained on cleanup - "
+           "time for reboot !\n");
 
-    wl24n_remove_procdir();
+  wl24n_remove_procdir();
 
-    unregister_pcmcia_driver(&dev_info);
+  unregister_pcmcia_driver(&dev_info);
 }
 
 /* == PROC wl24n_cs_close ==

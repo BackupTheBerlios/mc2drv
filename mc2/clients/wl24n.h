@@ -1,4 +1,4 @@
-/* $Id: wl24n.h,v 1.4 2002/12/11 00:01:40 jal2 Exp $ */
+/* $Id: wl24n.h,v 1.5 2003/02/01 13:43:59 jal2 Exp $ */
 
 /* ===========================================================    
     Copyright (C) 2002 Joerg Albert - joerg.albert@gmx.de
@@ -28,7 +28,10 @@ typedef int bool;
          " line %d\n", __LINE__)
 
 #define MIN(x,y) ((x) < (y) ? (x) : (y))
-
+/* 2.2.x kernels don't provide min() macro */
+#ifndef min
+# define min(x,y) MIN(x,y)
+#endif
 #ifndef FALSE
 #define FALSE 0
 #define TRUE 1
@@ -149,11 +152,11 @@ typedef enum {
 
 /* initializes the driver */
 void *wl24n_card_init(uint32 dbg_mask, uint32 msg_to_dbg_mask,
-          uint32 msg_from_dbg_mask,
-          int BaseAddr, int irq, LLCType_t llctype, 
-          BSSType_t bsstype, uint8 *ESSID, int ESSID_len,
-          uint8 Channel, int *open_counter, char **dev_name, 
-          uint32 trace_mask);
+                      uint32 msg_from_dbg_mask,
+                      int BaseAddr, int irq, LLCType_t llctype, 
+                      BSSType_t bsstype, uint8 *ESSID, int ESSID_len,
+                      uint8 Channel, int *open_counter, char **dev_name, 
+                      uint32 trace_mask);
 
 /* stops the driver */
 void wl24n_card_stop(void *priv);
@@ -170,4 +173,5 @@ void wl24n_interrupt(int irq, void *dev_id, struct pt_regs *regs);
 /* remove/create proc dir stuff common for all driver instances */
 void wl24n_remove_procdir(void);
 void wl24n_create_procdir(void);
+
 
